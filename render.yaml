@@ -1,0 +1,20 @@
+# Render.com blueprint. Render dashboard -> New + -> Blueprint -> pick this repo.
+# Then set the secret values it asks for (never commit them here).
+services:
+  - type: web
+    name: adca-audit-portal
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # one worker: review-page state is kept in memory between steps
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 900
+    healthCheckPath: /health
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: HOSTED
+        value: "1"
