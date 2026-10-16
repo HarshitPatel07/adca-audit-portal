@@ -160,8 +160,14 @@ def stock_statement(t):
         return None
     c = re.search(r"Unpaid Stocks \(Trade Creditors\)\|([\d.,]+)", f)
     b = re.search(r"Book-debt as per Annexure II\|([\d.,]+)", f)
+    def part(lbl):
+        x = re.search(lbl + r"\|([\d.,]+)", f)
+        return num(x.group(1)) if x else None
+    # category split as printed (Rs lakh) - compared with the fire policy's RM / WIP / FG sub-limits
+    split = dict(RM=part(r"1\. Total Raw Material"), WIP=part(r"2\. Stock in process"),
+                 Stores=part(r"3\. Stores & Spares"), FG=part(r"4\. Finished Goods"))
     return dict(date=d(m.group(1)), stock=num(s.group(1)), creditors=num(c.group(1)) if c else None,
-                debtors=num(b.group(1)) if b else None)
+                debtors=num(b.group(1)) if b else None, split=split if any(v is not None for v in split.values()) else None)
 
 
 def tally_kind(rows):
@@ -228,7 +234,7 @@ def policy(t, fname):
     insurer = re.search(r"THE ([A-Z ]+ASSURANCE CO\. LTD\.|[A-Z ]+INSURANCE CO(?:MPANY)?\.? LTD\.?)", f)
     p = dict(file=fname, no=no.group(1), frm=per.group(1), to=per.group(2), insured=(ins.group(1).strip(" :") if ins else ""),
              gstin=gst.group(1) if gst else "", prev=(prev.group(1) or "") if prev else "",
-             insurer=("THE " + insurer.group(1)) if insurer else "", first_loss=None, stock=None, build="", excluded="")
+             insurer=("THE " + insurer.group(1)) if insurer else "", first_loss=None, stock=None, build="", excluded="", sub=None)
     if "BURGLARY" in f.upper():
         p["cls"] = "Burglary"
         fl = re.search(r"First Loss Percentage\|?:?\s*\|?:?\s*(\d+)\s*%", f)
@@ -250,6 +256,7 @@ def policy(t, fname):
             if blocks:
                 rm = sum(b[4] for b in blocks); wip = sum(b[5] for b in blocks); fg = sum(b[6] for b in blocks)
                 p["stock"] = (rm + wip + fg) / 1e5
+                p["sub"] = dict(RM=rm / 1e5, WIP=wip / 1e5, FG=fg / 1e5)   # separate sums insured per stock category
                 p["build"] = " + ".join("loc%d: RM %g + WIP %g + FG %g" % (i + 1, b[4] / 1e5, b[5] / 1e5, b[6] / 1e5) for i, b in enumerate(blocks)) \
                     + " = %g lakh (Block Details)" % p["stock"]
                 p["excluded"] = "Building %g; FFF %g; P&M %g; Other contents %g (lakh)" % tuple(
@@ -511,6 +518,18 @@ def build_excel(F, cfg, out):
     if gst_ins:
         ws.append(["Grand Total (GSTR-1)"] + ["=SUMIF($A$4:$A$%d,\"*GSTR-1\",%s4:%s%d)" % (gr - 1, L(i + 2), L(i + 2), gr - 1) for i in range(len(months) + 1)])
         for c in ws[ws.max_row]: c.font = BOLD
+        # financial-year totals (April-March), as SUM formulas over the month columns above
+        fys = collections.OrderedDict()
+        for i, (y, m) in enumerate(months):
+            fys.setdefault(y if m >= 4 else y - 1, []).append(i + 2)
+        ws.append([])
+        hr = ws.max_row + 1
+        head(ws, hr, ["Financial-year totals (Rs)"] + ["FY %d-%02d%s" % (fy, (fy + 1) % 100, "" if len(c) == 12 else " (%d months)" % len(c))
+                                                     for fy, c in fys.items()])
+        for src_row in range(4, gr, 3):          # each GSTIN has 3 rows above: GSTR-1, GSTR-3B, Difference
+            for k in (0, 1):
+                ws.append([ws.cell(src_row + k, 1).value] + ["=SUM(%s%d:%s%d)" % (L(c[0]), src_row + k, L(c[-1]), src_row + k) for c in fys.values()])
+            ws.append(["Difference (GSTR-1 - 3B)"] + ["=%s%d-%s%d" % (L(j + 2), ws.max_row - 1, L(j + 2), ws.max_row) for j in range(len(fys))])
     bad = [r for r in F["g1"] + F["g3"] if not re.fullmatch(r"\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z]", r["gstin"])]
     ws.append([]); ws.append(["Rows skipped: 0 blank taxable value; invalid GSTIN: %d. Period: %s to %s." % (
         len(bad), mlabel(*months[0]) if months else "-", mlabel(*months[-1]) if months else "-")])
@@ -551,6 +570,13 @@ def build_insurance(wb, F, cfg):
     r = 1
     for n in notes:
         ws.cell(r, 1, n).font = Font(bold=True, color="C00000"); r += 1
+    if pols and not notes:
+        names = sorted({p["insured"] for p in pols if p["insured"]}); gsts = sorted({p["gstin"] for p in pols if p["gstin"]})
+        nog = [p["no"] for p in pols if not p["gstin"]]
+        ws.cell(r, 1, "Insured check: all %d policies are in the name of %s%s - same as the borrower%s.%s" % (
+            len(pols), " / ".join(names) or "(name not printed)", (", GSTIN " + " / ".join(gsts)) if gsts else "",
+            (" (" + "; ".join(n for n in own) + (", GSTIN " + cfg["gstin"] if cfg.get("gstin") else "") + ")") if own else "",
+            (" GSTIN not printed on: " + ", ".join(nog) + ".") if nog else "")).font = Font(bold=True, color="1A7F37"); r += 1
     if dups:
         ws.cell(r, 1, "%d duplicate upload(s) of the same policy number ignored." % dups); r += 1
     r += 1; ws.cell(r, 1, "Table 1 - Policy inventory (Rs lakh)").font = BOLD; r += 1
@@ -566,6 +592,7 @@ def build_insurance(wb, F, cfg):
     rows = collections.OrderedDict()
     for s in F["ss"]:
         rows.setdefault(s["date"], {})["ss"] = s["stock"]
+        rows[s["date"]]["split"] = s.get("split")
     for b in F["book"]:
         if b["date"]:
             rows.setdefault(b["date"], {})["book"] = b["stock"]
@@ -574,7 +601,9 @@ def build_insurance(wb, F, cfg):
     r = ws.max_row + 2
     ws.cell(r, 1, "Table 2 - Result (Rs lakh)").font = BOLD; r += 1
     head(ws, r, ["Month / Date", "Total Stock - Stock Statement", "Total Stock - Books", "Fire - Insured Amt (lakh)",
-                 "Burglary - Insured Amt (lakh)", "Fire policy", "Burglary policy", "Excess / (Shortfall) Fire", "Remark"])
+                 "Burglary - Insured Amt (lakh)", "Fire policy", "Burglary policy", "Excess / (Shortfall) Fire",
+                 "Fire sub-limit check (stock statement category vs policy SI)", "Remark"])
+    ws.column_dimensions["I"].width = 46; ws.column_dimensions["J"].width = 60
     gaps, prev_stock = [], None
     for day in sorted(rows):
         v = rows[day]
@@ -604,8 +633,26 @@ def build_insurance(wb, F, cfg):
         prev_stock = stock or prev_stock
         if v.get("ss") is None and v.get("book") is None:
             rem.insert(0, "No stock figure for this date - enter stock on the portal")
+        fp, _ = cover(use, "Fire", day); sub = fp.get("sub") if fp else None; sp = v.get("split")
+        if sub and sp:
+            parts, short = [], []
+            for k in ("RM", "WIP", "FG"):
+                st, lim = sp.get(k) or 0, sub.get(k) or 0
+                if st > lim:
+                    parts.append("%s %.2f > SI %.2f - SHORT %.2f" % (k, st, lim, st - lim)); short.append(k)
+                else:
+                    parts.append("%s %.2f / SI %.2f OK" % (k, st, lim))
+            if sp.get("Stores"):
+                parts.append("Stores %.2f - not in stock SI" % sp["Stores"])
+            subtxt = "; ".join(parts)
+            if short:
+                rem.insert(0, "UNDER-INSURED (Fire %s sub-limit)" % "/".join(short))
+        elif sub:
+            subtxt = "No category split for this date (books / typed stock) - total compared only"
+        else:
+            subtxt = "Policy has no category sub-limits" if fp else ""
         ws.append([lab, v.get("ss"), v.get("book"), cells[0][0], cells[1][0], cells[0][1], cells[1][1],
-                   (fire - stock) if isinstance(fire, (int, float)) and stock else None, "; ".join(rem) or "Adequately insured"])
+                   (fire - stock) if isinstance(fire, (int, float)) and stock else None, subtxt, "; ".join(rem) or "Adequately insured"])
         if any("UNDER" in x for x in rem):
             for c in ws[ws.max_row]: c.fill = WARN
     r = ws.max_row + 2
@@ -616,7 +663,8 @@ def build_insurance(wb, F, cfg):
         prevs = [p["prev"] for p in use if p["cls"] == cls and p["prev"] and pdate(p["frm"]) > day]
         ws.cell(r + 1 + i, 1, "%s %s: no %s policy supplied%s" % (day.strftime("%d-%m-%Y"), "", cls,
                 ("; missing policy probably %s (Prev. Policy No. on later schedule)" % prevs[0]) if prevs else ""))
-    ws.cell(ws.max_row + 2, 1, "Only stock in trade (RM + WIP + FG / Stocks in trade) counted. Building, P&M, FFF, other contents, cash, LOP excluded. Units: Rs lakh as in the stock statement.")
+    ws.cell(ws.max_row + 2, 1, "Fire policies with separate RM / WIP / FG sums insured are checked category by category against the stock statement split - a total within the SI can still be under-insured in one category.")
+    ws.cell(ws.max_row + 1, 1, "Only stock in trade (RM + WIP + FG / Stocks in trade) counted. Building, P&M, FFF, other contents, cash, LOP excluded. Units: Rs lakh as in the stock statement.")
     for row in ws.iter_rows():
         for c in row:
             c.alignment = Alignment(wrap_text=True, vertical="top")
