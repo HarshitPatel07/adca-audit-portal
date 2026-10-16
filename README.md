@@ -13,6 +13,11 @@ Tally debtor/creditor/stock files, MCA master) and download one Excel with three
 review page as "not read"; a scanned policy's stock SI is typed in the policy table. New bank / insurer formats are added
 as new rules in `app.py`.
 
+## Use it (no install)
+Open **https://harshitpatel07.github.io/adca-audit-portal/** in Chrome or Edge, pick the Working folder, check the
+review page, click Generate Excel. Everything runs inside the browser (Python via Pyodide) - files are never uploaded.
+The reading rules are in `docs/core.py`; the page is `docs/index.html` + `docs/portal.js`.
+
 ## Run on your PC
 ```
 pip install -r requirements.txt

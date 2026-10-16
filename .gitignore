@@ -4,3 +4,4 @@ Output/
 *.xlsx
 .env
 config.json
+.claude/

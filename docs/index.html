@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Audit Portal</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <h1>Stock Audit Portal <span class="sub">GST · Insurance · Summation</span></h1>
+  <p class="note">Runs fully inside your browser. Your files are <b>not uploaded</b> anywhere - they are read on this computer and the Excel is made here. Rules only, no AI.</p>
+  <p id="status" class="status">Loading the reader (first time about 30 seconds)...</p>
+
+  <section class="card" id="step1">
+    <h2>1. Pick the borrower's Working folder</h2>
+    <label>Whole folder</label><input type="file" id="folder" webkitdirectory multiple>
+    <label>- or individual files</label><input type="file" id="files" multiple>
+    <p class="small">Used: PDF, TXT, XLSX, XLS, CSV (photos skipped). Bank statements, GSTR-1/3B, insurance policies, stock statements, Tally debtors/creditors/stock, MCA master.</p>
+    <button id="readBtn" disabled>Read documents</button>
+  </section>
+
+  <section id="review" hidden>
+    <section class="card"><h2>Documents read</h2><div id="summary"></div></section>
+    <section class="card" id="unreadCard" hidden><h2>Not read by any rule (<span id="nUnread"></span>)</h2>
+      <p class="small">If any of these is a bank statement, GST return, policy or stock statement, its figures are NOT in the Excel. Send that file format to be added as a rule, or type a policy's stock SI below.</p>
+      <div class="wrap"><table id="unread"></table></div></section>
+    <section class="card"><h2>2. Check before generating</h2>
+      <label>Borrower name(s) - own-name credits = self transfer (one per line)</label><textarea id="own"></textarea>
+      <label>Borrower GSTIN</label><input type="text" id="gstin">
+      <label>Directors / partners / related parties - their credits are excluded (one per line; add the related-party note of the audited balance sheet)</label><textarea id="related"></textarea>
+      <label>Extra dates for insurance (visit date etc.): one per line as dd-mm-yyyy, label, stock in lakh (stock optional)</label>
+      <textarea id="extra" placeholder="30-09-2026, Visit date 30-09-2026, 117.13"></textarea>
+      <h3>Policies - correct the stock SI (lakh) or first-loss % if blank or wrong</h3>
+      <div class="wrap"><table id="pol"></table></div>
+      <button id="makeBtn">Generate Excel</button> <button id="againBtn" class="alt">Start again</button>
+    </section>
+    <section class="card"><h2>Every file</h2><div class="wrap"><table id="log"></table></div></section>
+  </section>
+</main>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.28.3/full/pyodide.js"></script>
+<script src="portal.js"></script>
+</body>
+</html>
