@@ -115,7 +115,7 @@ function showReview(s) {
       <td><input class="si" value="${p.stock ?? ""}"></td><td><input class="fl" value="${p.fl ?? ""}"></td>
       <td class="small">${esc(p.build)}</td><td class="small">${esc(p.file)}</td></tr>`).join("");
   $("log").innerHTML = "<tr><th>Read as</th><th>File</th><th>Result</th></tr>" + s.log.map(l =>
-    `<tr><td>${esc(l[0])}</td><td>${esc(l[1])}</td><td class="${["skipped", "ERROR"].includes(l[0]) ? "bad" : "ok"}">${esc(l[2])}</td></tr>`).join("");
+    `<tr><td>${esc(l[0])}</td><td>${esc(l[1])}</td><td class="${["skipped", "ERROR"].includes(l[0]) || /BREAKS|CHECK/.test(l[2]) ? "bad" : "ok"}">${esc(l[2])}</td></tr>`).join("");
   const ocrp = s.policies.filter(p => p.ocr).map(p => p.no);
   $("ocrWarn").hidden = !ocrp.length;
   $("ocrWarn").textContent = ocrp.length ? `Read from a scanned page by OCR - check against the policy before generating: ${ocrp.join(", ")} (amber rows).` : "";
@@ -131,7 +131,7 @@ let directors = [];
 function blankPolicies() {
   const out = [];
   document.querySelectorAll("#pol tr[data-no]").forEach(r => {
-    const blank = !r.querySelector(".si").value.trim();
+    const blank = !r.querySelector(".si").value.trim() && r.children[1].textContent !== "Other";
     r.classList.toggle("missing", blank);
     if (blank) out.push(r.dataset.no + " (" + r.children[1].textContent + ", " + r.children[2].textContent + ")");
   });

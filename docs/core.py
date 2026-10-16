@@ -33,12 +33,12 @@ def pdf_text(p):
         return ""
 
 
-def xlsx_rows(p):
+def xlsx_rows(p, max_rows=None):
     out = []
     try:
         wb = openpyxl.load_workbook(p, data_only=True, read_only=True)
         for ws in wb.worksheets:
-            for r in ws.iter_rows(values_only=True):
+            for r in ws.iter_rows(max_row=max_rows, values_only=True):
                 if any(c is not None for c in r):
                     out.append(list(r))
         wb.close()
@@ -79,34 +79,80 @@ def bank_pdf(t):
     """Axis 'Account Statement Report' PDF: S.NO|date|value date|particulars...|amount|DR/CR|balance|"""
     acc = re.search(r"Account No\s*:\s*(\d+)", t)
     f = t.replace("\n", "|")
-    pat = re.compile(r"\|(\d+)\|(\d{2}/\d{2}/\d{4})\|(\d{2}/\d{2}/\d{4})\|(.*?)\|([\d,]+\.\d\d)\|(DR|CR)\|(-?[\d,]+\.\d\d)\|")
+    # balance may print as '-,19,23,01,895.63' or with the minus on its own line: '-|,19,23,01,895.63'
+    pat = re.compile(r"\|(\d+)\|(\d{2}[/-]\d{2}[/-]\d{4})\|(\d{2}[/-]\d{2}[/-]\d{4})\|(.*?)\|([\d,]+\.\d\d)\|(DR|CR)\|(-?\|?[\d,]+\.\d\d)\|")
     tx = []
     for m in pat.finditer("|" + f):
         a = num(m.group(5)) * (1 if m.group(6) == "CR" else -1)
-        tx.append(dict(date=d(m.group(2)), narr=m.group(4).replace("|", ""), amt=a, bal=num(m.group(7))))
+        tx.append(dict(date=d(m.group(2)), narr=m.group(4).replace("|", ""), amt=a, bal=num(m.group(7).replace("|", ""))))
     return (acc.group(1) if acc else "bank"), tx
 
 
+def bal_msg(tx):
+    chk, bad = balance_check(tx)
+    if not chk:
+        return "no running balance to check"
+    return "running balance ties on all %d rows" % chk if not bad else "RUNNING BALANCE BREAKS on %d of %d rows - CHECK this file" % (bad, chk)
+
+
+def balance_check(tx):
+    """Running-balance test of one file's rows: previous balance + amount must equal the printed balance.
+    Returns (rows checked, rows that do not tie). A misread or missing row always shows up here."""
+    chk = bad = 0
+    for a, b in zip(tx, tx[1:]):
+        if a.get("bal") is None or b.get("bal") is None:
+            continue
+        chk += 1
+        # statements print an overdrawn CC balance either as negative or as a plain number with Dr
+        if abs(a["bal"] + b["amt"] - b["bal"]) > 0.5 and abs(a["bal"] - b["amt"] - b["bal"]) > 0.5:
+            bad += 1
+    return chk, bad
+
+
+def _cellnum(v):
+    """Excel cell -> number: 1,234.00 / '1,234.00 Dr' / '-' / None. Text that is not a number -> None."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    s = re.sub(r"(?i)\s*(dr|cr)\.?$", "", str(v or "").replace(",", "").strip())
+    try:
+        return float(s) if s not in ("", "-") else None
+    except ValueError:
+        return None
+
+
 def bank_table(rows):
-    """Any spreadsheet statement with Date + Narration + Debit/Withdrawal + Credit/Deposit columns."""
+    """Any spreadsheet statement: Date + Narration + either separate Debit / Credit columns, or one Amount column with a
+    Dr/Cr column. Returns (account no or None, transactions)."""
+    top = " ".join(str(c) for r in rows[:10] for c in r if c)
+    acc = re.search(r"(?:Account|A/c)\s*(?:No|Number)\.?\s*:?\s*(\d{9,})", top, re.I)
     for i, r in enumerate(rows[:40]):
-        low = [str(c or "").lower() for c in r]
+        low = [str(c or "").lower().strip() for c in r]
         di = next((j for j, c in enumerate(low) if "date" in c), None)
-        ni = next((j for j, c in enumerate(low) if any(k in c for k in ("narration", "particular", "description", "remarks"))), None)
-        dr = next((j for j, c in enumerate(low) if any(k in c for k in ("debit", "withdrawal"))), None)
-        cr = next((j for j, c in enumerate(low) if any(k in c for k in ("credit", "deposit"))), None)
-        if None not in (di, ni, dr, cr):
-            tx = []
-            for rr in rows[i + 1:]:
-                dd = rr[di]
-                dd = dd.date() if isinstance(dd, dt.datetime) else d(str(dd or ""))
-                if not dd:
-                    continue
-                a = num(rr[cr] or 0) - num(rr[dr] or 0)
-                if a:
-                    tx.append(dict(date=dd, narr=str(rr[ni] or ""), amt=a, bal=None))
-            return tx
-    return []
+        ni = next((j for j, c in enumerate(low) if any(k in c for k in ("narration", "particular", "description", "remarks", "details"))), None)
+        sg = next((j for j, c in enumerate(low) if re.fullmatch(r"(debit\s*/\s*credit|dr\s*/\s*cr|cr\s*/\s*dr|type|dr/cr)", c)), None)
+        am = next((j for j, c in enumerate(low) if c.startswith("amount")), None)
+        dr = next((j for j, c in enumerate(low) if j != sg and any(k in c for k in ("debit", "withdrawal"))), None)
+        cr = next((j for j, c in enumerate(low) if j != sg and any(k in c for k in ("credit", "deposit"))), None)
+        bl = next((j for j, c in enumerate(low) if "balance" in c), None)
+        if di is None or ni is None or not ((dr is not None and cr is not None) or (am is not None and sg is not None)):
+            continue
+        tx = []
+        for rr in rows[i + 1:]:
+            if len(rr) <= max(x for x in (di, ni, dr, cr, am, sg, bl) if x is not None):
+                continue
+            dd = rr[di]
+            dd = dd.date() if isinstance(dd, dt.datetime) else d(str(dd or ""))
+            if not dd:
+                continue
+            if dr is not None and cr is not None:
+                a = (_cellnum(rr[cr]) or 0) - (_cellnum(rr[dr]) or 0)
+            else:
+                v = _cellnum(rr[am]) or 0
+                a = v if str(rr[sg] or "").strip().upper().startswith("C") else -v
+            if a:
+                tx.append(dict(date=dd, narr=str(rr[ni] or ""), amt=round(a, 2), bal=_cellnum(rr[bl]) if bl is not None else None))
+        return (acc.group(1) if acc else None), tx
+    return None, []
 
 
 # ---------------- GST returns ----------------
@@ -249,6 +295,8 @@ def mca_directors(rows):
 # ---------------- insurance ----------------
 def policy(t, fname):
     f = t.replace("\n", "|")
+    if not re.search(r"NEW INDIA ASSURANCE", f[:20000], re.I):      # other insurers: label-value rules below
+        return policy_generic(f, fname) if re.search(r"Policy\s*(No|Number)", f, re.I) else None
     if not re.search(r"Policy (No|Number)", f) or "Sum Insured" not in f and "SI" not in f:
         return None
     no = re.search(r"Policy (?:Number|No\.?)\s*\|?:?\s*\|?\s*(\d{10,})", f)
@@ -298,6 +346,234 @@ def policy(t, fname):
     return p
 
 
+# ---------- other insurers (IFFCO Tokio, ICICI Lombard, Bajaj, generic): label-value rules on the '|' text ----------
+INSURERS = [(r"IFFCO[- ]TOKIO", "IFFCO-TOKIO GENERAL INSURANCE CO. LTD"), (r"ICICI Lombard", "ICICI LOMBARD GENERAL INSURANCE CO. LTD"),
+            (r"Bajaj (?:General|Allianz)", "BAJAJ GENERAL INSURANCE LTD"), (r"NEW INDIA ASSURANCE", "THE NEW INDIA ASSURANCE CO. LTD."),
+            (r"United India Insurance", "UNITED INDIA INSURANCE CO. LTD"), (r"National Insurance", "NATIONAL INSURANCE CO. LTD"),
+            (r"Oriental Insurance", "THE ORIENTAL INSURANCE CO. LTD"), (r"HDFC ERGO", "HDFC ERGO GENERAL INSURANCE CO. LTD"),
+            (r"Tata AIG", "TATA AIG GENERAL INSURANCE CO. LTD"), (r"SBI General", "SBI GENERAL INSURANCE CO. LTD"),
+            (r"Reliance General", "RELIANCE GENERAL INSURANCE CO. LTD"), (r"Future Generali", "FUTURE GENERALI INDIA INSURANCE CO. LTD"),
+            (r"Cholamandalam", "CHOLAMANDALAM MS GENERAL INSURANCE CO. LTD"), (r"Royal Sundaram", "ROYAL SUNDARAM GENERAL INSURANCE CO. LTD"),
+            (r"Universal Sompo", "UNIVERSAL SOMPO GENERAL INSURANCE CO. LTD"), (r"Liberty General", "LIBERTY GENERAL INSURANCE LTD"),
+            (r"Kotak (?:Mahindra )?General", "KOTAK GENERAL INSURANCE CO. LTD"), (r"Go Digit|Digit General", "GO DIGIT GENERAL INSURANCE LTD")]
+AMT = r"[`₹]?\s*(?:Rs\.?\s*)?([\d,]{5,}(?:\.\d+)?)"
+
+
+def _gdate(s):
+    """'28/01/2026', '05-JUN-2026', '07-JUN-26', 'Feb 02, 2025' -> 'dd/mm/yyyy'"""
+    s = s.strip()
+    for f in ("%d/%m/%Y", "%d-%m-%Y", "%d-%b-%Y", "%d-%b-%y", "%b %d, %Y", "%d %b %Y", "%d.%m.%Y"):
+        try:
+            return dt.datetime.strptime(s.title() if "%b" in f else s, f).strftime("%d/%m/%Y")
+        except ValueError:
+            pass
+    return None
+
+
+DATE = r"(\d{2}[/.-](?:\d{2}|[A-Za-z]{3})[/.-]\d{2,4}|[A-Z][a-z]{2} \d{1,2}, \d{4})"
+
+
+def _period(f):
+    i = f.find("Period of Insurance")
+    seg = f[i:i + 400] if i >= 0 else f
+    m = re.search(r"From\W{0,6}(?:\d{2}:\d{2}(?::\d{2})?\s*(?:Hours of\s*)?)?" + DATE + r".{0,80}?To\W{0,6}(?:Midnight of\s*)?" + DATE, seg, re.S)
+    if not m and i >= 0:
+        m = re.search(r"From\W{0,6}(?:\d{2}:\d{2}(?::\d{2})?\s*(?:Hours of\s*)?)?" + DATE + r".{0,80}?To\W{0,6}(?:Midnight of\s*)?" + DATE, f, re.S)
+    if not m:
+        m = re.search(DATE + r"\s*To\s*" + DATE, f)
+    if not m:
+        return None, None
+    return _gdate(m.group(1)), _gdate(m.group(2))
+
+
+def _label(f, labels, val=r"([^|]{3,80})"):
+    for lb in labels:
+        m = re.search(lb + r"\s*\|?\s*:?\s*\|?\s*:?\s*" + val, f, re.I)
+        if m:
+            return m.group(1).strip(" :|")
+    return ""
+
+
+def policy_generic(f, fname):
+    no = _label(f, [r"(?<!Fire )Policy\s*(?:Number|No\.?)"], r"([A-Z0-9][A-Z0-9/-]{5,}\d)")
+    if not no or not re.search(r"\d", no):
+        m = re.search(r"policy number\s+([A-Z0-9][A-Z0-9/-]{5,}\d)", f, re.I)
+        no = m.group(1) if m else ""
+    frm, to = _period(f)
+    if not (no and frm and to):
+        return None
+    head = f[:6000].upper()
+    if re.search(r"BOILER|MACHINERY BREAKDOWN POLICY|MARINE|MOTOR|HEALTH|GROUP PERSONAL|LIABILITY POLICY", head) and "FIRE" not in head[:3000]:
+        cls = "Other"
+    elif not re.search(r"stock", f, re.I):
+        cls = "Other"
+    elif "BURGLARY" in head[:4000]:
+        cls = "Burglary"
+    else:
+        cls = "Fire"
+    insurer = next((nm for rx, nm in INSURERS if re.search(rx, f, re.I)), "")
+    insured = _label(f, [r"Name of the Insured", r"Insured['’]?s? Name", r"\|Insured(?!'s)"])
+    gstin = _label(f, [r"GSTIN Number", r"GSTIN\s*/\s*UIN", r"GSTIN ID"], r"(\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z])")
+    for m in ([] if gstin else re.finditer(r"(GSTIN(?: Number| ID|\s*/\s*UIN|/UIN)?)\W{0,8}(\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z])", f)):
+        pre = f[max(0, m.start() - 300):m.start()]
+        if not re.search(r"Company|Issuing Office|Insurer", pre, re.I):
+            gstin = m.group(2); break
+    prev = _label(f, [r"Previous Policy (?:No\.?|Number)", r"Prev\. Policy no\.?"], r"([A-Z0-9][A-Z0-9/-]{5,}\d)")
+    p = dict(file=fname, no=no, frm=frm, to=to, insured=insured, gstin=gstin, prev=prev, insurer=insurer,
+             first_loss=None, stock=None, build="", excluded="", sub=None, cls=cls, iar="INDUSTRIAL ALL RISK" in head)
+    fl = re.search(r"First Loss (?:Percentage|%|Basis)\W{0,6}(\d{1,3})\s*%", f, re.I)
+    if fl:
+        p["first_loss"] = int(fl.group(1))
+    if cls == "Other":
+        p["build"] = "Not a fire / burglary policy - stock not covered"
+        return p
+    # 1) burglary item table: Item SI | Item Premium ... description | SI | premium ...
+    found = []
+    if cls == "Burglary":
+        i = f.find("Item SI")
+        j = f.find("Base Premium", i) if i >= 0 else -1
+        if i >= 0:
+            seg = f[i:j if j > 0 else i + 3000]
+            amts = [num(x) for x in re.findall(r"\|([\d,]{4,}\.\d\d)\|", seg)]
+            sis = amts[0::2]
+            if sis:
+                found.append(("Item SI (burglary schedule)", sum(sis)))
+    # 2) sum-insured table: 'Stocks' label, optional description lines, amount
+    if not found:
+        for m in re.finditer(r"\|(Stocks?(?:\s*[-:][^|]{0,100})?)\|((?:[^|]{0,130}\|){0,6}?)" + AMT + r"\|", f, re.I):
+            lab, desc, v = m.group(1), m.group(2), num(m.group(3))
+            # skip a 'stock in process' line and the header row of a column table (row number / 'Total sum insured' before the amount)
+            if re.match(r"Stocks? in Process", lab, re.I) or re.search(r"\d{1,3}%|Upto|maximum|Total", desc, re.I) \
+                    or re.search(r"\|\d{1,2}\|", "|" + desc):
+                continue
+            found.append(((lab + " " + desc.replace("|", " ")).strip()[:90], v)); break
+        wip = re.search(r"\|Stocks? in Process\|" + AMT + r"\|", f, re.I)
+        if found and wip and num(wip.group(1)) > 0:
+            found.append(("Stock in Process", num(wip.group(1))))
+    if found:
+        tot = sum(v for _, v in found)
+        p["stock"] = tot / 1e5
+        p["build"] = " + ".join("%s %s" % (lab, "{:,.2f}".format(v)) for lab, v in found) + " = %.2f lakh" % (tot / 1e5)
+        clause = re.search(r"STOCK SI\s*-\s*(\d{5,})", f)
+        if clause and abs(num(clause.group(1)) - tot) > 1:
+            p["build"] += " | POLICY WORDING SAYS 'STOCK SI-%s' (%.2f lakh) - CHECK which is right" % (clause.group(1), num(clause.group(1)) / 1e5)
+    else:
+        p["build"] = "Stock SI not found in this policy text - type it on the review page"
+    ex = []
+    for lab in ("Building", "Plant (?:&|and) Machinery", "Furniture[^|]{0,40}", "Contents", "Electrical Installations?"):
+        m = re.search(r"\|(" + lab + r")[^|]{0,40}\|" + AMT + r"\|", f, re.I)
+        if m and num(m.group(2)) > 0:
+            ex.append("%s %.2f" % (m.group(1)[:30], num(m.group(2)) / 1e5))
+    p["excluded"] = "; ".join(ex) + (" (lakh)" if ex else "")
+    return p
+
+
+# ---------------- book data saved as PDF (Tally reports, company stock tables, company stock statements) ----------------
+PDF_AMT = r"-?[\d,]+(?:\.\d+)?"
+HEADWORDS = {"particulars", "debit", "credit", "closing balance", "opening balance", "balance", "transactions", "closing", "opening",
+             "grand total", "total", "page", "group summary", "sundry debtors", "sundry creditors", "debtors", "creditors", "value",
+             "rate", "quantity", "nett", "dr", "cr"}
+
+
+def _pdf_amount(tok):
+    t = tok.strip().replace(" Dr", "").replace(" Cr", "").replace(" dr", "").replace(" cr", "")
+    return bool(re.fullmatch(PDF_AMT, t)) and re.search(r"\d", t) is not None
+
+
+def tally_pdf_kind(t):
+    """'Sundry Debtors' / 'Sundry Creditors' / 'Stock' / 'Sales' report saved from Tally as PDF; None otherwise."""
+    f = t.replace("\n", "|"); ends = f[:1500] + "|" + f[-1500:]
+    if re.search(r"Group Monthly Summary|Monthly Summary", ends) and re.search(r"\|Sales(?: Accounts| Local| A/c)?\|", f) \
+            and not re.search(r"Purchase", ends, re.I):
+        return "Sales"
+    if re.search(r"Stock (?:Group )?Summary", ends):
+        return "Stock"
+    if re.search(r"\|(?:Sundry )?Debtors\b", ends, re.I) and re.search(r"Group Summary|Closing Balance|Closing", ends, re.I):
+        return "Sundry Debtors"
+    if re.search(r"\|(?:Sundry )?Creditors\b", ends, re.I) and re.search(r"Group Summary|Closing Balance|Closing", ends, re.I):
+        return "Sundry Creditors"
+    return None
+
+
+def tally_pdf_names(t):
+    """Party names: a text token directly followed by an amount token."""
+    toks = [x.strip() for x in t.split("\n")]
+    out = []
+    for a, b in zip(toks, toks[1:]):
+        if a and re.search(r"[A-Za-z]{2}", a) and not _pdf_amount(a) and _pdf_amount(b) and a.lower() not in HEADWORDS \
+                and not re.match(r"(page|cin|pan|e-mail|udyam|gstin|\d+-[a-z]{3}-\d+)", a.lower()):
+            out.append(a)
+    return out
+
+
+def tally_pdf_stock(t):
+    """Tally Stock (Group) Summary PDF: closing value of the Grand Total row, dated by the period end."""
+    f = t.replace("\n", "|")
+    # Tally prints 'G r a n d T o t a l'; PDF readers differ on the spacing ('G r a n d  T o t a l')
+    m = re.search(r"G\s*r\s*a\s*n\s*d\s*T\s*o\s*t\s*a\s*l\|(" + PDF_AMT + r")\|", f)
+    per = re.search(r"\d{1,2}-[A-Za-z]{3}-\d{2,4} to (\d{1,2}-[A-Za-z]{3}-\d{2,4})", f)
+    if m and per and d(per.group(1)):
+        return dict(date=d(per.group(1)), stock=round(num(m.group(1)) / 1e5, 5))
+    return None
+
+
+def stock_month_table(t):
+    """Company table 'Month | ... | Total' with one row per month (e.g. 'Sep-25 | ... | 94,552,504') -> book stock per month-end."""
+    f = t.replace("\n", "|")
+    if not re.search(r"Month\s*\|", f) or "Total" not in f:
+        return []
+    out = []
+    for m in re.finditer(r"(?<=\|)([A-Z][a-z]{2})-(\d{2})\|((?:[^|]*\|){1,30}?)(?=[A-Z][a-z]{2}-\d{2}\||$)", "|" + f + "|"):
+        nums = [num(x) for x in re.findall(PDF_AMT, m.group(3)) if re.search(r"\d", x)]
+        if nums and m.group(1).lower() in MON:
+            y, mo = 2000 + int(m.group(2)), MON[m.group(1).lower()]
+            out.append(dict(date=month_end(y, mo), stock=round(nums[-1] / 1e5, 5)))
+    return out
+
+
+def tally_pdf_sales(t):
+    """Tally Group Monthly Summary of Sales Accounts (PDF): month -> net transactions of that month."""
+    f = t.replace("\n", "|")
+    st = re.search(r"1-([A-Za-z]{3})-(\d{2,4}) to", f)
+    if not st:
+        return None
+    y = int(st.group(2)); y = y + 2000 if y < 100 else y; m = MON[st.group(1).lower()]
+    names = [dt.date(2000, i, 1).strftime("%B") for i in range(1, 13)]
+    out, prev = {}, None
+    for mm in re.finditer(r"(?<=\|)(" + "|".join(names) + r")\|(" + PDF_AMT + r")\s*(Cr|Dr)?(?:\|(" + PDF_AMT + r")\s*(Cr|Dr)?)?(?=\|)", f):
+        mi = names.index(mm.group(1)) + 1
+        while mi != m:
+            m = m % 12 + 1; y += (m == 1)
+        closing = num(mm.group(2)) * (1 if (mm.group(3) or "Cr") == "Cr" else -1)
+        out[(y, m)] = round(closing - prev, 2) if prev is not None else round(num(mm.group(4)) if mm.group(4) else closing, 2)
+        prev = closing
+    return out or None
+
+
+def company_stock_statement(t):
+    """Company-format stock statement ('Stock Statement as on dd-mm-yyyy', 'Rs. in Lacs'): stock, unpaid creditors, book debts.
+    Text is often OCR'd - '1,,026.87' and similar are cleaned, and the result is marked for checking."""
+    f = t.replace("\n", "|")
+    m = re.search(r"Stock\s*Statement\s*as\s*on\s*(\d{2}[-/.]\d{2}[-/.]\d{4})", f, re.I)
+    if not m:
+        return None
+    def amt(lbl):
+        x = re.search(lbl + r".{0,90}?\|\(?(\d[\d, ]*\.\d{1,2})\)?(?=\|)", f, re.I)
+        if not x:
+            return None
+        v = re.sub(r"[ ,]", "", x.group(1)).strip(".")
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    stock = amt(r"\|\d?\|?Stock(?! Statement)")
+    if stock is None:
+        return None
+    lakh = bool(re.search(r"L[aA]c|L[aA]kh", f[:3000]))
+    return dict(date=d(m.group(1).replace(".", "-").replace("/", "-")), stock=stock if lakh else stock / 1e5,
+                creditors=amt(r"Unpaid Stock\s*/?\s*Creditor"), debtors=amt(r"Total Book Debts"), split=None, check=True)
+
+
 # ---------------- scan everything ----------------
 def scan(paths, log):
     F = dict(bank={}, g1=[], g3=[], ss=[], book=[], debtors=set(), creditors=set(), directors=[], policies=[], names=set())
@@ -312,9 +588,30 @@ def scan(paths, log):
                         F[key].append(r); log.append(("GSTR-" + r["kind"], fn, "%d-%02d taxable %s" % (r["ym"] + (r["taxable"],)))); break
                 else:
                     if "Account Statement Report" in t or "Statement of Axis Bank" in t:
-                        a, tx = bank_pdf(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); log.append(("Bank PDF", fn, "%d txns" % len(tx)))
+                        a, tx = bank_pdf(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); log.append(("Bank PDF", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
                     elif stock_statement(t):
                         r = stock_statement(t); F["ss"].append(r); log.append(("Stock statement", fn, "%s stock %s" % (r["date"], r["stock"])))
+                    elif company_stock_statement(t):
+                        r = company_stock_statement(t); F["ss"].append(r)
+                        log.append(("Stock statement", fn, "%s stock %s lakh (company format, text looks OCR'd - check)" % (r["date"], r["stock"])))
+                    elif tally_pdf_kind(t):
+                        k = tally_pdf_kind(t)
+                        if k == "Sundry Debtors":
+                            n = tally_pdf_names(t); F["debtors"].update(n); log.append(("Debtor ledger", fn, "%d names (PDF)" % len(n)))
+                        elif k == "Sundry Creditors":
+                            n = tally_pdf_names(t); F["creditors"].update(n); log.append(("Creditor ledger", fn, "%d names (PDF)" % len(n)))
+                        elif k == "Stock":
+                            r = tally_pdf_stock(t)
+                            if r:
+                                F["book"].append(r); log.append(("Book stock", fn, "%s %s lakh (PDF)" % (r["date"], r["stock"])))
+                            else:
+                                log.append(("skipped", fn, "stock summary without a grand total"))
+                        else:
+                            r = tally_pdf_sales(t) or {}; F.setdefault("sales", {}).update(r)
+                            log.append(("Books sales", fn, "%d months (PDF)" % len(r)))
+                    elif stock_month_table(t):
+                        r = stock_month_table(t); F["book"].extend(r)
+                        log.append(("Book stock", fn, "%d month-ends from a monthly stock table (PDF)" % len(r)))
                     elif policy(t, fn):
                         r = policy(t, fn); F["policies"].append(r); F["names"].add(r["insured"])
                         log.append(("Policy " + r["cls"], fn, "%s %s-%s stock SI %s" % (r["no"], r["frm"], r["to"], r["stock"])))
@@ -323,9 +620,18 @@ def scan(paths, log):
             elif ext == "txt":
                 t = open(p, encoding="utf-8", errors="replace").read()
                 if "STATEMENT" in t and "BALANCE" in t:
-                    a, tx = bank_txt(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); log.append(("Bank TXT", fn, "%d txns" % len(tx)))
+                    a, tx = bank_txt(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); log.append(("Bank TXT", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
             elif ext in ("xlsx", "xlsm", "csv"):
-                rows = xlsx_rows(p) if ext != "csv" else [l.split(",") for l in open(p, encoding="utf-8", errors="replace")]
+                if ext == "csv":
+                    rows = [l.rstrip("\n").split(",") for l in open(p, encoding="utf-8", errors="replace")]
+                else:
+                    # classify from the first 200 rows; read the whole workbook only for a type that is used
+                    # (big sales registers / GST Excel downloads took 40-85 s each to read in full)
+                    top = xlsx_rows(p, 200)
+                    k0, h0 = tally_kind(top)
+                    if not (k0 or tally_sales(top, h0) or mca_directors(top) or bank_table(top)[1]):
+                        log.append(("skipped", fn, "not recognised")); continue
+                    rows = xlsx_rows(p)
                 k, head = tally_kind(rows)
                 if k == "Stock Summary":
                     r = tally_stock(rows, head)
@@ -340,16 +646,27 @@ def scan(paths, log):
                 elif mca_directors(rows):
                     F["directors"] = mca_directors(rows); log.append(("MCA", fn, ", ".join(F["directors"])))
                 else:
-                    tx = bank_table(rows)
+                    acc, tx = bank_table(rows)
                     if tx:
                         [x.update(src=fn) for x in tx]
-                        F["bank"].setdefault(fn, []).extend(tx); log.append(("Bank sheet", fn, "%d txns" % len(tx)))
+                        F["bank"].setdefault(acc or fn, []).extend(tx); log.append(("Bank sheet", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
                     else:
                         log.append(("skipped", fn, "not recognised"))
             else:
                 log.append(("skipped", fn, "type not used"))
         except Exception as e:
             log.append(("ERROR", fn, repr(e)[:120]))
+    # a sheet without an account number whose rows are the same as a real account's (e.g. a working copy such as
+    # Summation.xlsx) is merged into that account - otherwise its credits would be counted twice
+    accts = [k for k in F["bank"] if re.fullmatch(r"\d{9,}", k)]
+    for k in [k for k in list(F["bank"]) if k not in accts]:
+        mine = {(t["date"], round(t["amt"], 2)) for t in F["bank"][k]}
+        for a in accts:
+            theirs = {(t["date"], round(t["amt"], 2)) for t in F["bank"][a]}
+            if mine and len(mine & theirs) >= 0.9 * len(mine):
+                F["bank"][a].extend(F["bank"].pop(k))
+                log.append(("Bank copy", k, "same rows as account %s - treated as a copy, not a second account" % a))
+                break
     return F
 
 
@@ -366,18 +683,34 @@ def nospace(s):
     return re.sub(r"[^A-Z0-9]", "", s.upper())
 
 
-def name_hit(name, narr):
+import functools
+
+
+@functools.lru_cache(maxsize=None)
+def _name_key(name):
+    """Words of a party name and its two partial-match patterns, built once per name (not once per bank row)."""
+    t = toks(name)
+    part = re.compile(r"(^|/)\s*" + re.escape(t[0]) + r"\s*(?:(?:AND|&)\s*)?" + re.escape(t[1][0])) if len(t) >= 2 and len(t[0]) >= 5 else None
+    cut = re.compile(r"(^|/)\s*" + re.escape(t[0]) + r"\s*$") if t and len(t[0]) >= 6 else None
+    return t, part, cut
+
+
+def name_hit(name, narr, n=None, U=None):
     """'full' = first two words found; 'part' = distinctive first word (>=6 chars) only."""
-    t = toks(name); n = nospace(narr)
+    t, part, cut = _name_key(name)
+    if n is None:
+        n = nospace(narr)
+    if not t or t[0] not in n:          # every match below needs the first word in the narration - cheap test first
+        return None
     if len(t) >= 2 and len(t[0] + t[1]) >= 6 and (t[0] + t[1]) in n:
         return "full"
-    U = narr.upper()
+    U = U if U is not None else narr.upper()
     # partial matches only where the payer name STARTS (after '/' or at the start) - never inside "X S/O <name>"
-    if len(t) >= 2 and len(t[0]) >= 5 and re.search(r"(^|/)\s*" + t[0] + r"\s*(?:(?:AND|&)\s*)?" + t[1][0], U):
+    if part is not None and part.search(U):
         return "part"
-    if len(t) == 1 and len(t[0]) >= 5 and t[0] in n:
+    if len(t) == 1 and len(t[0]) >= 5:
         return "full"
-    if t and len(t[0]) >= 6 and re.search(r"(^|/)\s*" + t[0] + r"\s*$", U):  # name cut right after first word, e.g. 'Hdfc Bank /AGRAWAL'
+    if cut is not None and cut.search(U):  # name cut right after first word, e.g. 'Hdfc Bank /AGRAWAL'
         return "part"
     return None
 
@@ -385,7 +718,7 @@ def name_hit(name, narr):
 KW = [  # (category, keywords, reason)
     ("Bank-originated credit", ("INT.COLL", "INTEREST", "INT CR", "TXN REV", "REVERSAL", "LOAN DISB", "DISBURS", "FD CLOS", "SWEEP", "MATURITY", "CHQ RTN", "CHEQUE RETURN"), "Bank entry: interest / reversal / disbursement / FD"),
     ("Refunds", ("RETURN/", "NEFT/RETURN", "REFUND", "RTN/"), "Own payment returned or refund"),
-    ("Tax-related", ("GST REFUND", "CBDT", "ITD", "INCOME TAX", "TREASU", "PMVBRY", "SUBSIDY", "GOVT", "GOVERNMENT"), "Government / tax credit"),
+    ("Tax-related", ("GST REFUND", "CBDT", "ITD", "INCOME TAX", "TDS REFUND", "PMVBRY", "SUBSIDY"), "Tax refund / government scheme credit"),
     ("Investment/other income", ("DIVIDEND", "MUTUAL FUND", "REDEMPTION", " MF "), "Investment income"),
     ("Loans/borrowings (non-bank)", ("UNSECURED LOAN", "LOAN FROM", "USL"), "Loan received"),
 ]
@@ -393,40 +726,48 @@ KW = [  # (category, keywords, reason)
 
 def classify(tx, F, related, own):
     out = []
+    debtors = sorted(F["debtors"], key=len, reverse=True)
+    creditors = sorted(F["creditors"])
+    deb_first = {toks(dn)[0] for dn in debtors if toks(dn)}
+    own_keys = [("".join(toks(nm)), nm) for nm in own if nm and toks(nm)]
     for t in tx:
         if t["amt"] <= 0:
             continue
-        u = t["narr"].upper(); r = dict(t)
+        u = t["narr"].upper(); r = dict(t); n = nospace(u)
         hit = None
-        for nm in own:
-            if nm and toks(nm) and "".join(toks(nm)) in nospace(u):
+        for key, nm in own_keys:
+            if key in n:
                 hit = ("EXC", "Self-transfer / contra", "Own name (%s) - transfer from own account" % nm)
         if not hit:
             for nm in related:
-                if name_hit(nm, u):
-                    extra = " - also in debtor ledger" if any(name_hit(nm, x) for x in [u]) and any(toks(nm)[:1] == toks(dn)[:1] for dn in F["debtors"]) else ""
+                if name_hit(nm, u, n, u):
+                    extra = " - also in debtor ledger" if toks(nm) and toks(nm)[0] in deb_first else ""
                     hit = ("EXC", "Director/Partner/Owner/Related party", "Related party / director: %s%s" % (nm, extra)); break
         if not hit:
             for cat, kws, why in KW:
                 k = next((k for k in kws if k in u), None)
                 if k:
                     hit = ("EXC", cat, "%s (narration has '%s')" % (why, k.strip())); break
+        best = None
         if not hit:
-            for nm in F["creditors"]:
-                if name_hit(nm, u) and not any(name_hit(dn, u) for dn in F["debtors"]):
-                    hit = ("EXC", "Refunds", "Payer is a supplier in creditor ledger (%s) - refund" % nm); break
-        if not hit:
-            best = None
-            for nm in sorted(F["debtors"], key=len, reverse=True):
-                h = name_hit(nm, u)
+            # debtor match once per row (used both to block the supplier-refund rule and as the debtor receipt)
+            for nm in debtors:
+                h = name_hit(nm, u, n, u)
                 if h == "full":
                     best = (nm, ""); break
                 if h == "part" and not best:
                     best = (nm, "first-word match only")
-            if best:
-                hit = ("INC", best[0], best[1])
+            for nm in creditors:
+                if not best and name_hit(nm, u, n, u):
+                    hit = ("EXC", "Refunds", "Payer is a supplier in creditor ledger (%s) - refund" % nm); break
+        if not hit and best:
+            hit = ("INC", best[0], best[1])
         if not hit:
-            hit = ("REV", "Unidentified / needs review", "Payer not in debtor ledger and no rule matched - confirm nature")
+            if re.search(r"TREASU|GOVT|GOVERNMENT|COLLECTORATE|SECRETARIAT|SECRETRIATE", u):
+                hit = ("REV", "Unidentified / needs review", "Government / treasury payment - a government customer paying for "
+                       "supplies (debtor receipt) or a refund / subsidy (exclude); confirm from the debtor ledger")
+            else:
+                hit = ("REV", "Unidentified / needs review", "Payer not in debtor ledger and no rule matched - confirm nature")
         r["b"], r["cat"], r["why"] = hit
         out.append(r)
     return out
@@ -434,13 +775,13 @@ def classify(tx, F, related, own):
 
 def dedupe(txs):
     """Same account read from several files (e.g. full-period TXT + monthly PDFs): for each month keep the ONE source
-    file with the most transactions for that month - never mix two files in one month."""
+    file - never mix two files in one month. Preference: running balance ties for that month, then most transactions."""
     by = collections.defaultdict(lambda: collections.defaultdict(list))
     for t in txs:
         by[(t["date"].year, t["date"].month)][t.get("src", "")].append(t)
     out = []
     for k in sorted(by):
-        src = max(by[k].items(), key=lambda kv: len(kv[1]))
+        src = max(by[k].items(), key=lambda kv: (balance_check(kv[1])[1] == 0, len(kv[1])))
         out += [dict(t, src=src[0]) for t in src[1]]
     return sorted(out, key=lambda t: t["date"])
 
@@ -451,9 +792,24 @@ def pdate(s):
 
 
 def cover(pols, cls, day):
-    live = [p for p in pols if p["cls"] == cls and pdate(p["frm"]) <= day <= pdate(p["to"])]
-    live.sort(key=lambda p: pdate(p["frm"]))
-    return live[-1] if live else None, len(live) > 1
+    """Policy (or several) of one class in force on day. A renewal overlap of a few days -> the later policy (rule 9).
+    Policies running side by side for months (separate locations / blocks) -> their stock SIs are added (rule 3)."""
+    live = sorted((p for p in pols if p["cls"] == cls and pdate(p["frm"]) <= day <= pdate(p["to"])), key=lambda p: pdate(p["frm"]))
+    if not live:
+        return None, ""
+    keep = []
+    for p in live:
+        keep = [k for k in keep if (min(pdate(k["to"]), pdate(p["to"])) - max(pdate(k["frm"]), pdate(p["frm"]))).days > 60]
+        keep.append(p)
+    note = "overlap - later policy used" if len(live) > 1 and len(keep) == 1 else ""
+    if len(keep) == 1:
+        return keep[0], note
+    sis = [k["stock"] for k in keep]
+    fls = {k["first_loss"] for k in keep}
+    agg = dict(keep[-1], no=" + ".join(k["no"] for k in keep), stock=None if None in sis else round(sum(sis), 2),
+               first_loss=fls.pop() if len(fls) == 1 else None, sub=None, iar=any(k.get("iar") for k in keep))
+    return agg, "%d policies in force together (separate locations) - stock SIs added: %s" % (
+        len(keep), " + ".join("%s" % k["stock"] for k in keep))
 
 
 def month_end(y, m):
@@ -605,11 +961,14 @@ def build_excel(F, cfg, out):
 
 def build_insurance(wb, F, cfg):
     ws = wb.create_sheet("Insurance")
-    pols, seen = [], set()
+    # one row per policy number; of several copies keep a stock policy that has its stock SI (not an endorsement / letter)
+    best = collections.OrderedDict()
     for p in F["policies"]:
-        if p["no"] in seen:
-            continue
-        seen.add(p["no"]); pols.append(p)
+        q = best.get(p["no"])
+        rank = lambda x: (x["cls"] != "Other", x["stock"] is not None)
+        if q is None or rank(p) > rank(q):
+            best[p["no"]] = p
+    pols = list(best.values())
     dups = len(F["policies"]) - len(pols)
     own = [n for n in cfg["own"] if n]
     notes = []
@@ -619,6 +978,8 @@ def build_insurance(wb, F, cfg):
             p["foreign"] = True
         if cfg.get("gstin") and p["gstin"] and p["gstin"] != cfg["gstin"]:
             notes.append("Policy %s GSTIN %s differs from borrower GSTIN %s." % (p["no"], p["gstin"], cfg["gstin"]))
+    other = [p for p in pols if p["cls"] == "Other"]
+    pols = [p for p in pols if p["cls"] != "Other"]
     use = [p for p in pols if not p.get("foreign")]
     r = 1
     for n in notes:
@@ -632,6 +993,8 @@ def build_insurance(wb, F, cfg):
             (" GSTIN not printed on: " + ", ".join(nog) + ".") if nog else "")).font = Font(bold=True, color="1A7F37"); r += 1
     if dups:
         ws.cell(r, 1, "%d duplicate upload(s) of the same policy number ignored." % dups); r += 1
+    if other:
+        ws.cell(r, 1, "Not stock policies (left out): " + "; ".join("%s - %s (%s)" % (p["no"], p["build"], p["file"]) for p in other)); r += 1
     r += 1; ws.cell(r, 1, "Table 1 - Policy inventory (Rs lakh)").font = BOLD; r += 1
     head(ws, r, ["Policy No.", "Insurer", "Class", "Period of Insurance", "Qualifying SI (stock only)", "Build-up / source line",
                  "Items excluded and value", "First loss %", "Insured / GSTIN", "Prev. Policy No.", "File"],
@@ -646,6 +1009,7 @@ def build_insurance(wb, F, cfg):
     for s in F["ss"]:
         rows.setdefault(s["date"], {})["ss"] = s["stock"]
         rows[s["date"]]["split"] = s.get("split")
+        rows[s["date"]]["check"] = rows[s["date"]].get("check") or bool(s.get("check"))
     for b in F["book"]:
         if b["date"]:
             rows.setdefault(b["date"], {})["book"] = b["stock"]
@@ -670,7 +1034,7 @@ def build_insurance(wb, F, cfg):
             else:
                 si = p["stock"] if p["stock"] is not None else "SI not stated"
                 cells.append((si, p["no"]))
-                if ov: rem.append("%s overlap - later policy used" % cls)
+                if ov: rem.append("%s: %s" % (cls, ov))
                 if cls == "Burglary" and p["first_loss"]:
                     rem.append("Burglary first loss %d%% = max claim %.2f" % (p["first_loss"], (p["stock"] or 0) * p["first_loss"] / 100))
         stock = max([x for x in (v.get("ss"), v.get("book")) if x is not None] or [0])
@@ -686,6 +1050,8 @@ def build_insurance(wb, F, cfg):
         prev_stock = stock or prev_stock
         if v.get("ss") is None and v.get("book") is None:
             rem.insert(0, "No stock figure for this date - enter stock on the portal")
+        if v.get("check"):
+            rem.append("stock statement figure read from a scanned / OCR'd page - CHECK against the statement")
         fp, _ = cover(use, "Fire", day); sub = fp.get("sub") if fp else None; sp = v.get("split")
         if sub and sp:
             parts, short = [], []
@@ -714,8 +1080,10 @@ def build_insurance(wb, F, cfg):
         ws.cell(r + 1, 1, "None - every date is inside a supplied Fire and Burglary policy period (inclusive).")
     for i, (day, cls) in enumerate(gaps):
         prevs = [p["prev"] for p in use if p["cls"] == cls and p["prev"] and pdate(p["frm"]) > day]
-        ws.cell(r + 1 + i, 1, "%s %s: no %s policy supplied%s" % (day.strftime("%d-%m-%Y"), "", cls,
-                ("; missing policy probably %s (Prev. Policy No. on later schedule)" % prevs[0]) if prevs else ""))
+        fp, _ = cover(use, "Fire", day)
+        iar = " (fire policy %s is Industrial All Risk - check whether it covers burglary / theft)" % fp["no"] if cls == "Burglary" and fp and fp.get("iar") else ""
+        ws.cell(r + 1 + i, 1, "%s: no %s policy supplied%s%s" % (day.strftime("%d-%m-%Y"), cls,
+                ("; missing policy probably %s (Prev. Policy No. on later schedule)" % prevs[0]) if prevs else "", iar))
     ws.cell(ws.max_row + 2, 1, "Fire policies with separate RM / WIP / FG sums insured are checked category by category against the stock statement split - a total within the SI can still be under-insured in one category.")
     ws.cell(ws.max_row + 1, 1, "Only stock in trade (RM + WIP + FG / Stocks in trade) counted. Building, P&M, FFF, other contents, cash, LOP excluded. Units: Rs lakh as in the stock statement.")
     for row in ws.iter_rows():
@@ -744,7 +1112,7 @@ def browser_summary():
     ocr_done = {b for a, b, c in log if a.startswith("OCR")}
     unk = [(b, c) for a, b, c in log if a == "skipped" and b not in ocr_done and b.lower().rsplit(".", 1)[-1] in ("pdf", "xlsx", "xlsm", "xls", "csv")]
     unk += [(p["file"], "policy read, but stock SI not in the text layer (scanned part) - type it in the policy table")
-            for p in F["policies"] if p["stock"] is None]
+            for p in F["policies"] if p["stock"] is None and p["cls"] != "Other"]
     gst = sorted({r["gstin"] for r in F["g1"] + F["g3"]})
     return json.dumps(dict(
         banks=[[k, len(v)] for k, v in F["bank"].items()], g1=len(F["g1"]), g3=len(F["g3"]), gstins=gst,
@@ -767,7 +1135,7 @@ def ocr_candidates():
     for pth in _B["paths"]:
         by_name.setdefault(os.path.basename(pth), pth)
     want = [b for a, b, c in log if a == "skipped" and "no text layer" in c]
-    want += [p["file"] for p in F["policies"] if p["stock"] is None or (p["cls"] == "Burglary" and p["first_loss"] is None)]
+    want += [p["file"] for p in F["policies"] if p["cls"] != "Other" and (p["stock"] is None or (p["cls"] == "Burglary" and p["first_loss"] is None))]
     out = []
     for fn in dict.fromkeys(want):
         pth = by_name.get(fn)
@@ -829,6 +1197,11 @@ def ocr_merge(path, text, fields_json):
                 if fl:
                     p["first_loss"] = int(fl.group(1)); p["ocr"] = True; p["build"] += " | first loss %s%% by OCR - check" % fl.group(1)
                     got.append("first loss %s%%" % fl.group(1))
+    if not got:
+        ss = stock_statement(text) or company_stock_statement(text)
+        if ss:
+            ss["check"] = True; F["ss"].append(ss)
+            got.append("stock statement %s: stock %s lakh" % (ss["date"], ss["stock"]))
     log.append(("OCR", fn, ("read: " + ", ".join(got) + " - CHECK these against the scan") if got else "OCR done - no policy / statement figures found"))
     return browser_summary()
 
