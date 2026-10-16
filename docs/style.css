@@ -16,3 +16,6 @@ table{border-collapse:collapse;width:100%;font-size:13px}td,th{border:1px solid 
 .warn{color:var(--bad);font-weight:600;font-size:13px;margin:6px 0}
 td input.si,td input.fl{min-width:80px}
 tr.missing td{background:color-mix(in srgb,var(--bad) 12%,transparent)}tr.missing input.si{border:2px solid var(--bad)}
+.ocrwarn{color:#9a6700;font-weight:600;font-size:13px;margin:6px 0}
+@media (prefers-color-scheme:dark){.ocrwarn{color:#e3b341}}
+tr.ocr td{background:color-mix(in srgb,#d4a72c 18%,transparent)}

@@ -9,7 +9,7 @@
 <body>
 <main>
   <h1>Stock Audit Portal <span class="sub">GST · Insurance · Summation</span></h1>
-  <p class="note">Runs fully inside your browser. Your files are <b>not uploaded</b> anywhere - they are read on this computer and the Excel is made here. Rules only, no AI.</p>
+  <p class="note">Runs fully inside your browser. Your files are <b>not uploaded</b> anywhere - they are read on this computer and the Excel is made here. Rules only, no AI. Scanned pages are read by OCR in this browser and marked for you to check.</p>
   <p id="status" class="status">Loading the reader (first time about 30 seconds)...</p>
 
   <section class="card" id="step1">
@@ -34,6 +34,7 @@
       <textarea id="extra" placeholder="30-09-2026, Visit date 30-09-2026, 117.13"></textarea>
       <h3>Policies - correct the stock SI (lakh) or first-loss % if blank or wrong</h3>
       <p class="warn" id="polWarn" hidden></p>
+      <p class="ocrwarn" id="ocrWarn" hidden></p>
       <div class="wrap"><table id="pol"></table></div>
       <button id="makeBtn">Generate Excel</button> <button id="againBtn" class="alt">Start again</button>
     </section>

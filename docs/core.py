@@ -178,6 +178,33 @@ def tally_kind(rows):
     return None, head
 
 
+def tally_sales(rows, head):
+    """Tally 'Monthly Summary' of a SALES ledger/group (not purchase): month -> credit - debit (sales net of returns/credit notes)."""
+    if "Monthly Summary" not in head or not re.search(r"\bSales\b", head) or re.search(r"Purchase", head, re.I):
+        return None
+    st = re.search(r"1-([A-Za-z]{3})-(\d{2,4}) to", head)
+    if not st:
+        return None
+    y = int(st.group(2)); y = y + 2000 if y < 100 else y; m = MON[st.group(1).lower()]
+    out, seen = {}, set()
+    names = [dt.date(2000, i, 1).strftime("%B") for i in range(1, 13)]
+    for r in rows:
+        n = str(r[0] or "").strip()
+        if n in names:
+            mm = names.index(n) + 1
+            while mm != m:                      # months run in order from the period start
+                m = m % 12 + 1; y += (m == 1)
+            if (y, m) in seen:
+                continue
+            seen.add((y, m))
+            nums = [c for c in r[1:] if isinstance(c, (int, float))]
+            dr = num(r[1] or 0) if len(r) > 1 and isinstance(r[1], (int, float)) else 0.0
+            cr = num(r[2] or 0) if len(r) > 2 and isinstance(r[2], (int, float)) else 0.0
+            if nums:
+                out[(y, m)] = round(cr - dr, 2)
+    return out or None
+
+
 def tally_end(head):
     m = re.search(r"to (\d{1,2}-[A-Za-z]{3}-\d{2,4})", head)
     return d(m.group(1)) if m else None
@@ -307,6 +334,9 @@ def scan(paths, log):
                     F["debtors"].update(tally_names(rows)); log.append(("Debtor ledger", fn, "names read"))
                 elif k == "Sundry Creditors":
                     F["creditors"].update(tally_names(rows)); log.append(("Creditor ledger", fn, "names read"))
+                elif tally_sales(rows, head):
+                    r = tally_sales(rows, head); F.setdefault("sales", {}).update(r)
+                    log.append(("Books sales", fn, "%d months (sales net of returns)" % len(r)))
                 elif mca_directors(rows):
                     F["directors"] = mca_directors(rows); log.append(("MCA", fn, ", ".join(F["directors"])))
                 else:
@@ -518,6 +548,20 @@ def build_excel(F, cfg, out):
     if gst_ins:
         ws.append(["Grand Total (GSTR-1)"] + ["=SUMIF($A$4:$A$%d,\"*GSTR-1\",%s4:%s%d)" % (gr - 1, L(i + 2), L(i + 2), gr - 1) for i in range(len(months) + 1)])
         for c in ws[ws.max_row]: c.font = BOLD
+        grand = ws.max_row; books_row = None
+        sales = F.get("sales") or {}
+        if sales:                                # books cover every GSTIN of the company -> compared with the grand total
+            ws.append(["Books - sales register (Tally, net of returns)"] + [sales.get(m, "not in books") for m in months]
+                      + ["=SUM(B%d:%s%d)" % (ws.max_row + 1, L(len(months) + 1), ws.max_row + 1)])
+            books_row = ws.max_row
+            # total = sum of monthly differences, so months missing from the books are not counted as a gap
+            ws.append(["Difference (Books - GSTR-1, months in books)"] + ["=IF(ISNUMBER(%s%d),%s%d-%s%d,\"-\")" % (L(i + 2), books_row, L(i + 2), books_row, L(i + 2), grand)
+                                                         for i in range(len(months))] + ["=SUM(B%d:%s%d)" % (ws.max_row + 1, L(len(months) + 1), ws.max_row + 1)])
+            diff_row = ws.max_row
+            for i, m in enumerate(months):
+                g = sum(g1[(gi, m)]["taxable"] for gi in gst_ins if (gi, m) in g1)
+                if m in sales and abs(sales[m] - g) > 1:
+                    ws.cell(ws.max_row, i + 2).fill = WARN
         # financial-year totals (April-March), as SUM formulas over the month columns above
         fys = collections.OrderedDict()
         for i, (y, m) in enumerate(months):
@@ -530,6 +574,12 @@ def build_excel(F, cfg, out):
             for k in (0, 1):
                 ws.append([ws.cell(src_row + k, 1).value] + ["=SUM(%s%d:%s%d)" % (L(c[0]), src_row + k, L(c[-1]), src_row + k) for c in fys.values()])
             ws.append(["Difference (GSTR-1 - 3B)"] + ["=%s%d-%s%d" % (L(j + 2), ws.max_row - 1, L(j + 2), ws.max_row) for j in range(len(fys))])
+        if books_row:
+            ws.append(["Books - sales register (months in books)"] + ["=SUM(%s%d:%s%d)" % (L(c[0]), books_row, L(c[-1]), books_row) for c in fys.values()])
+            ws.append(["Difference (Books - GSTR-1, months in books)"] + ["=SUM(%s%d:%s%d)" % (L(c[0]), diff_row, L(c[-1]), diff_row) for c in fys.values()])
+            miss = [mlabel(*m) for m in months if m not in sales]
+            if miss:
+                ws.append(["Months not in the books file: " + ", ".join(miss)])
     bad = [r for r in F["g1"] + F["g3"] if not re.fullmatch(r"\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z]", r["gstin"])]
     ws.append([]); ws.append(["Rows skipped: 0 blank taxable value; invalid GSTIN: %d. Period: %s to %s." % (
         len(bad), mlabel(*months[0]) if months else "-", mlabel(*months[-1]) if months else "-")])
@@ -544,7 +594,10 @@ def build_excel(F, cfg, out):
     for s in wb.worksheets:
         for row in s.iter_rows(min_row=2):
             for c in row:
-                if isinstance(c.value, float): c.number_format = NUMF
+                # money: every float; on the GST sheet also whole-rupee ints and formulas (no counts live there)
+                if isinstance(c.value, float) or (s.title == "GST" and c.column > 1 and not isinstance(c.value, bool)
+                                                  and (isinstance(c.value, int) or str(c.value).startswith("="))):
+                    c.number_format = NUMF
                 if isinstance(c.value, dt.date): c.number_format = "DD-MM-YYYY"
     wb.save(out)
     return allc
@@ -682,18 +735,102 @@ def browser_scan(root):
     paths = sorted(os.path.join(r, f) for r, _, fs in os.walk(root) for f in fs)
     log = []
     F = scan(paths, log)
-    _B.clear(); _B.update(F=F, log=log)
-    unk = [(b, c) for a, b, c in log if a == "skipped" and b.lower().rsplit(".", 1)[-1] in ("pdf", "xlsx", "xlsm", "xls", "csv")]
+    _B.clear(); _B.update(F=F, log=log, paths=paths)
+    return browser_summary()
+
+
+def browser_summary():
+    F, log = _B["F"], _B["log"]
+    ocr_done = {b for a, b, c in log if a.startswith("OCR")}
+    unk = [(b, c) for a, b, c in log if a == "skipped" and b not in ocr_done and b.lower().rsplit(".", 1)[-1] in ("pdf", "xlsx", "xlsm", "xls", "csv")]
     unk += [(p["file"], "policy read, but stock SI not in the text layer (scanned part) - type it in the policy table")
             for p in F["policies"] if p["stock"] is None]
     gst = sorted({r["gstin"] for r in F["g1"] + F["g3"]})
     return json.dumps(dict(
         banks=[[k, len(v)] for k, v in F["bank"].items()], g1=len(F["g1"]), g3=len(F["g3"]), gstins=gst,
         ss=len(F["ss"]), book=len(F["book"]), npol=len(F["policies"]), debtors=len(F["debtors"]), creditors=len(F["creditors"]),
-        directors=F["directors"], borrower=next(iter(sorted(n for n in F["names"] if n)), ""),
-        policies=[dict(no=p["no"], cls=p["cls"], frm=p["frm"], to=p["to"], stock=p["stock"], fl=p["first_loss"], build=p["build"], file=p["file"])
-                  for p in F["policies"]],
+        directors=F["directors"], borrower=next(iter(sorted(n for n in F["names"] if n)), ""), books_sales=len(F.get("sales", {})),
+        policies=[dict(no=p["no"], cls=p["cls"], frm=p["frm"], to=p["to"], stock=p["stock"], fl=p["first_loss"], build=p["build"],
+                       file=p["file"], ocr=bool(p.get("ocr"))) for p in F["policies"]],
         unread=unk, log=log))
+
+
+# ---------------- OCR of scanned pages (done in the browser by tesseract.js; parsed here by fixed rules) ----------------
+OCR_MAX_PAGES = 3
+OCR_FIELDS = ["First Loss Percentage"]        # boxed cells read separately (digits only) - JS crops right of the label
+
+
+def ocr_candidates():
+    """Scanned PDFs (no text layer, <= OCR_MAX_PAGES pages) and policies whose stock SI is in a scanned part."""
+    F, log = _B["F"], _B["log"]
+    by_name = {}
+    for pth in _B["paths"]:
+        by_name.setdefault(os.path.basename(pth), pth)
+    want = [b for a, b, c in log if a == "skipped" and "no text layer" in c]
+    want += [p["file"] for p in F["policies"] if p["stock"] is None or (p["cls"] == "Burglary" and p["first_loss"] is None)]
+    out = []
+    for fn in dict.fromkeys(want):
+        pth = by_name.get(fn)
+        if not pth:
+            continue
+        try:
+            with pymupdf.open(pth) as doc:
+                n = len(doc)
+        except Exception:
+            continue
+        if n <= OCR_MAX_PAGES:
+            out.append(dict(path=pth, file=fn, pages=n))
+    return json.dumps(dict(files=out, fields=OCR_FIELDS))
+
+
+def ocr_render(path, page, out):
+    """Render one page as a 300 dpi grey PNG for OCR."""
+    with pymupdf.open(path) as doc:
+        open(out, "wb").write(doc[page].get_pixmap(dpi=300, colorspace=pymupdf.csGRAY).tobytes("png"))
+
+
+def _ocr_num(s):
+    s = s.replace("O", "0").replace("o", "0").replace(",", "")
+    return float(s)
+
+
+def ocr_merge(path, text, fields_json):
+    """Apply fixed rules to OCR text of one file. Every value found is marked 'OCR - check'."""
+    F, log = _B["F"], _B["log"]; fn = os.path.basename(path)
+    fields = json.loads(fields_json or "{}")
+    T = re.sub(r"[ \t]+", " ", text)
+    got = []
+    # 1) the policy already read from this same file's text layer, 2) an existing policy whose number appears in the OCR text,
+    # 3) only then a new policy from the OCR'd number (OCR can add stray digits from table borders)
+    p = next((x for x in F["policies"] if x["file"] == fn), None) or         next((x for x in F["policies"] if x["no"] in re.sub(r"\D", "", T)), None)
+    no = re.search(r"Policy\s*(?:Number|No\.?)\s*[\[\]|:;!]*\s*(\d{15,})", T)
+    if p is not None or no:
+        if p is None:
+            per = re.search(r"From:?\s*(\d{2}/\d{2}/\d{4}).{0,120}?(\d{2}/\d{2}/\d{4})", T, re.S)
+            if per:
+                p = dict(file=fn, no=no.group(1), frm=per.group(1), to=per.group(2), insured="", gstin="", prev="", insurer="",
+                         first_loss=None, stock=None, build="", excluded="", sub=None,
+                         cls="Burglary" if "BURGLARY" in T.upper() else "Fire")
+                ins = re.search(r"Insured'?s?\s*Name\W*([A-Z/][A-Z0-9 ./&-]{4,})", T)
+                g = re.search(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z])\b", T)
+                p["insured"] = ins.group(1).strip() if ins else ""; p["gstin"] = g.group(1) if g else ""
+                F["policies"].append(p); F["names"].add(p["insured"]); got.append("policy %s" % p["no"])
+        if p is not None:
+            if p["stock"] is None:
+                m = re.search(r"STOCK\s*DETAILS.*?\n(.*?)\b(\d[\d,O]{5,})\b", T, re.S | re.I) if p["cls"] == "Burglary" else \
+                    re.search(r"Stocks?[^\n]{0,60}?\b(\d[\d,O]{5,})\b", T, re.I)
+                if m:
+                    v = _ocr_num(m.groups()[-1])
+                    p["stock"] = v / 1e5; p["ocr"] = True
+                    p["build"] = "OCR-read - CHECK against the policy: '%s %s'" % ((m.group(1).strip()[:60] + " ") if p["cls"] == "Burglary" else "", m.groups()[-1])
+                    got.append("stock SI %.2f lakh" % p["stock"])
+            if p["cls"] == "Burglary" and p["first_loss"] is None:
+                fl = re.search(r"(\d{1,3})\s*%", fields.get("First Loss Percentage", ""))
+                if fl:
+                    p["first_loss"] = int(fl.group(1)); p["ocr"] = True; p["build"] += " | first loss %s%% by OCR - check" % fl.group(1)
+                    got.append("first loss %s%%" % fl.group(1))
+    log.append(("OCR", fn, ("read: " + ", ".join(got) + " - CHECK these against the scan") if got else "OCR done - no policy / statement figures found"))
+    return browser_summary()
 
 
 def browser_make(form_json, out):

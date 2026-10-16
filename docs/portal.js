@@ -42,11 +42,64 @@ async function readDocs() {
     }
     status(`Reading ${files.length} files...`);
     await new Promise(r => setTimeout(r, 30));
-    const s = JSON.parse(py.globals.get("core").browser_scan("/work"));
+    let s = JSON.parse(py.globals.get("core").browser_scan("/work"));
+    s = await runOCR(s);
     showReview(s);
     status("Read. Check the details below, then Generate Excel.");
   } catch (e) { status("Error while reading: " + e, true); console.error(e); }
   $("readBtn").disabled = false;
+}
+
+// ---- OCR for scanned pages: tesseract.js runs in this browser (no upload, no key); core.py applies the fixed rules ----
+let ocrLib = null;
+async function loadOCR() {
+  if (!ocrLib) ocrLib = new Promise((res, rej) => {
+    const sc = document.createElement("script");
+    sc.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+    sc.onload = res; sc.onerror = () => rej(new Error("OCR library did not load")); document.head.appendChild(sc);
+  });
+  return ocrLib;
+}
+
+async function cropRight(blob, line, label) {
+  // crop the boxed cell to the right of a label (e.g. "First Loss Percentage"), scaled x2 for small print
+  const img = await createImageBitmap(blob), c = document.createElement("canvas");
+  const lw = line.words.filter(w => label.split(" ").some(k => w.text.toLowerCase().includes(k.toLowerCase().slice(0, 5))));
+  const x0 = lw.length ? Math.max(...lw.map(w => w.bbox.x1)) : line.bbox.x0;
+  const y0 = Math.max(0, line.bbox.y0 - 8), h = line.bbox.y1 - line.bbox.y0 + 16, wd = Math.min(img.width - x0, 900);
+  c.width = wd * 2; c.height = h * 2; c.getContext("2d").drawImage(img, x0, y0, wd, h, 0, 0, wd * 2, h * 2);
+  return new Promise(r => c.toBlob(r));
+}
+
+async function runOCR(s) {
+  const core = py.globals.get("core");
+  const cand = JSON.parse(core.ocr_candidates());
+  if (!cand.files.length) return s;
+  try { await loadOCR(); } catch (e) { status("OCR not available (" + e.message + ") - scanned pages skipped.", true); return s; }
+  const total = cand.files.reduce((a, f) => a + f.pages, 0); let done = 0;
+  const worker = await Tesseract.createWorker("eng");
+  for (const f of cand.files) {
+    let text = ""; const fields = {};
+    for (let pg = 0; pg < f.pages; pg++) {
+      status(`Reading scanned page ${++done} of ${total} with OCR (${f.file})...`);
+      core.ocr_render(f.path, pg, "/ocr.png");
+      const blob = new Blob([py.FS.readFile("/ocr.png")], {type: "image/png"});
+      await worker.setParameters({tessedit_pageseg_mode: "3", tessedit_char_whitelist: ""});
+      const r = await worker.recognize(blob, {}, {blocks: true, text: true});
+      text += r.data.text + "\n";
+      const lines = (r.data.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines));
+      for (const label of cand.fields) {
+        if (fields[label]) continue;
+        const ln = lines.find(l => new RegExp(label.replace(/ /g, "\\s*"), "i").test(l.text));
+        if (!ln) continue;
+        await worker.setParameters({tessedit_pageseg_mode: "7", tessedit_char_whitelist: "0123456789.,%:"});
+        fields[label] = (await worker.recognize(await cropRight(blob, ln, label))).data.text.trim();
+      }
+    }
+    s = JSON.parse(core.ocr_merge(f.path, text, JSON.stringify(fields)));
+  }
+  await worker.terminate();
+  return s;
 }
 
 function showReview(s) {
@@ -58,11 +111,14 @@ function showReview(s) {
   $("unreadCard").hidden = !s.unread.length; $("nUnread").textContent = s.unread.length;
   $("unread").innerHTML = "<tr><th>File</th><th>Why</th></tr>" + s.unread.map(u => `<tr><td>${esc(u[0])}</td><td class="small">${esc(u[1])}</td></tr>`).join("");
   $("pol").innerHTML = "<tr><th>Policy</th><th>Class</th><th>Period</th><th>Stock SI (lakh)</th><th>First loss %</th><th>Build-up</th><th>File</th></tr>" +
-    s.policies.map(p => `<tr data-no="${esc(p.no)}"><td>${esc(p.no)}</td><td>${esc(p.cls)}</td><td>${esc(p.frm)} to ${esc(p.to)}</td>
+    s.policies.map(p => `<tr data-no="${esc(p.no)}" class="${p.ocr ? "ocr" : ""}"><td>${esc(p.no)}</td><td>${esc(p.cls)}</td><td>${esc(p.frm)} to ${esc(p.to)}</td>
       <td><input class="si" value="${p.stock ?? ""}"></td><td><input class="fl" value="${p.fl ?? ""}"></td>
       <td class="small">${esc(p.build)}</td><td class="small">${esc(p.file)}</td></tr>`).join("");
   $("log").innerHTML = "<tr><th>Read as</th><th>File</th><th>Result</th></tr>" + s.log.map(l =>
     `<tr><td>${esc(l[0])}</td><td>${esc(l[1])}</td><td class="${["skipped", "ERROR"].includes(l[0]) ? "bad" : "ok"}">${esc(l[2])}</td></tr>`).join("");
+  const ocrp = s.policies.filter(p => p.ocr).map(p => p.no);
+  $("ocrWarn").hidden = !ocrp.length;
+  $("ocrWarn").textContent = ocrp.length ? `Read from a scanned page by OCR - check against the policy before generating: ${ocrp.join(", ")} (amber rows).` : "";
   directors = s.directors.map(x => x.trim().toUpperCase());
   document.querySelectorAll("#pol input.si").forEach(i => i.addEventListener("input", checkWarnings));
   $("related").addEventListener("input", checkWarnings);
