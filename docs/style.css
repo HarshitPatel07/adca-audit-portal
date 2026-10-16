@@ -13,3 +13,6 @@ button:disabled{opacity:.5;cursor:default}button.alt{background:var(--muted)}
 table{border-collapse:collapse;width:100%;font-size:13px}td,th{border:1px solid var(--line);padding:5px 7px;text-align:left;vertical-align:top}th{background:var(--head)}
 .wrap{overflow-x:auto}.small,.note{font-size:13px;color:var(--muted)}.ok{color:var(--ok)}.bad{color:var(--bad)}
 .status{font-weight:600;color:var(--accent)}.status.err{color:var(--bad)}
+.warn{color:var(--bad);font-weight:600;font-size:13px;margin:6px 0}
+td input.si,td input.fl{min-width:80px}
+tr.missing td{background:color-mix(in srgb,var(--bad) 12%,transparent)}tr.missing input.si{border:2px solid var(--bad)}

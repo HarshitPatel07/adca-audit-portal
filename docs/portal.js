@@ -63,10 +63,47 @@ function showReview(s) {
       <td class="small">${esc(p.build)}</td><td class="small">${esc(p.file)}</td></tr>`).join("");
   $("log").innerHTML = "<tr><th>Read as</th><th>File</th><th>Result</th></tr>" + s.log.map(l =>
     `<tr><td>${esc(l[0])}</td><td>${esc(l[1])}</td><td class="${["skipped", "ERROR"].includes(l[0]) ? "bad" : "ok"}">${esc(l[2])}</td></tr>`).join("");
+  directors = s.directors.map(x => x.trim().toUpperCase());
+  document.querySelectorAll("#pol input.si").forEach(i => i.addEventListener("input", checkWarnings));
+  $("related").addEventListener("input", checkWarnings);
+  checkWarnings();
   $("review").hidden = false; $("step1").hidden = true;
 }
 
-function makeExcel() {
+let directors = [];
+
+function blankPolicies() {
+  const out = [];
+  document.querySelectorAll("#pol tr[data-no]").forEach(r => {
+    const blank = !r.querySelector(".si").value.trim();
+    r.classList.toggle("missing", blank);
+    if (blank) out.push(r.dataset.no + " (" + r.children[1].textContent + ", " + r.children[2].textContent + ")");
+  });
+  return out;
+}
+
+function onlyDirectors() {
+  const rel = $("related").value.split("\n").map(x => x.trim().toUpperCase()).filter(Boolean);
+  return rel.every(x => directors.includes(x));
+}
+
+function checkWarnings() {
+  const b = blankPolicies();
+  $("polWarn").hidden = !b.length;
+  $("polWarn").textContent = b.length ? `${b.length} polic${b.length > 1 ? "ies have" : "y has"} no stock SI: ${b.join("; ")}. ` +
+    "Every date in that period will show 'SI not stated'. Type the stock SI (lakh) from the policy schedule." : "";
+  $("relWarn").hidden = !onlyDirectors();
+}
+
+function confirmGenerate() {
+  const msgs = [], b = blankPolicies();
+  if (b.length) msgs.push(`- ${b.length} policy stock SI blank: ${b.join("; ")}`);
+  if (onlyDirectors()) msgs.push("- Related parties: only the MCA directors are listed. Have you added the related parties from the balance sheet note?");
+  return !msgs.length || confirm("Before generating, please check:\n\n" + msgs.join("\n\n") + "\n\nOK = generate anyway, Cancel = go back and fill them.");
+}
+
+function makeExcel(skipCheck) {
+  if (skipCheck !== true && !confirmGenerate()) return;
   const pol = {};
   document.querySelectorAll("#pol tr[data-no]").forEach(r => pol[r.dataset.no] = {si: r.querySelector(".si").value, fl: r.querySelector(".fl").value});
   const form = {own: $("own").value, gstin: $("gstin").value, related: $("related").value, extra: $("extra").value, pol};

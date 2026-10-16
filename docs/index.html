@@ -29,9 +29,11 @@
       <label>Borrower name(s) - own-name credits = self transfer (one per line)</label><textarea id="own"></textarea>
       <label>Borrower GSTIN</label><input type="text" id="gstin">
       <label>Directors / partners / related parties - their credits are excluded (one per line; add the related-party note of the audited balance sheet)</label><textarea id="related"></textarea>
+      <p class="warn" id="relWarn">Only the MCA directors are listed. Add every related party from the audited balance sheet's related-party note (associate / group companies, relatives) - otherwise their credits are counted as debtor receipts.</p>
       <label>Extra dates for insurance (visit date etc.): one per line as dd-mm-yyyy, label, stock in lakh (stock optional)</label>
       <textarea id="extra" placeholder="30-09-2026, Visit date 30-09-2026, 117.13"></textarea>
       <h3>Policies - correct the stock SI (lakh) or first-loss % if blank or wrong</h3>
+      <p class="warn" id="polWarn" hidden></p>
       <div class="wrap"><table id="pol"></table></div>
       <button id="makeBtn">Generate Excel</button> <button id="againBtn" class="alt">Start again</button>
     </section>
