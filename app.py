@@ -2,7 +2,7 @@ r"""AUDIT PORTAL - GST / Insurance / Summation (debtor receipts) Excel from raw 
 
 RUN:   local  -> python app.py   (opens http://127.0.0.1:5055, folder path allowed, no login)
        live   -> Render runs "gunicorn app:app" (upload only, ADMIN_PASSWORD login, files deleted after the Excel)
-       AI     -> set ANTHROPIC_API_KEY so Claude reads the files the rules cannot (other banks, other insurers, scans)
+       RULES ONLY - no AI. A file no rule can read is listed as "not read" and its figures are typed on the review page.
 Upload every raw file of a borrower (or point to its folder). Files are recognised by CONTENT:
   bank statement  : Axis .txt (Finacle), Axis PDF "Account Statement Report", any .xlsx/.csv with Date/Narration/Debit/Credit
   GSTR-1 / GSTR-3B: GST portal PDFs
@@ -623,124 +623,6 @@ def build_insurance(wb, F, cfg):
 
 
 
-# ---------------- AI fallback (only for files the rules could not read) ----------------
-# Uses ANTHROPIC_API_KEY. The AI only TRANSCRIBES the document into the same structures the rules produce;
-# every downstream rule (classification, policy-date matching, GST pivot) is unchanged. Bank rows read by AI
-# are checked against their own running balance and the result is shown on the review page.
-import base64
-AI_MODEL = os.environ.get("AI_MODEL", "claude-opus-5-5")
-NS = {"type": ["string", "null"]}
-NN = {"type": ["number", "null"]}
-AI_SCHEMA = {
-    "type": "object", "additionalProperties": False,
-    "required": ["doc_type", "bank", "gst", "policy", "stock"],
-    "properties": {
-        "doc_type": {"type": "string", "enum": ["bank_statement", "gstr1", "gstr3b", "insurance_policy", "stock_statement", "other"]},
-        "bank": {"type": "object", "additionalProperties": False, "required": ["account_no", "opening_balance", "transactions"],
-                 "properties": {"account_no": NS, "opening_balance": NN, "transactions": {"type": "array", "items": {
-                     "type": "object", "additionalProperties": False, "required": ["date", "narration", "debit", "credit", "balance"],
-                     "properties": {"date": {"type": "string"}, "narration": {"type": "string"}, "debit": NN, "credit": NN, "balance": NN}}}}},
-        "gst": {"type": "object", "additionalProperties": False, "required": ["gstin", "period_month", "period_year", "taxable_value", "filing_date"],
-                "properties": {"gstin": NS, "period_month": NN, "period_year": NN, "taxable_value": NN, "filing_date": NS}},
-        "policy": {"type": "object", "additionalProperties": False,
-                   "required": ["policy_no", "insurer", "insured_name", "gstin", "policy_class", "period_from", "period_to", "prev_policy_no",
-                                "stock_sum_insured_rs", "stock_build_up", "excluded_items", "first_loss_percent"],
-                   "properties": {"policy_no": NS, "insurer": NS, "insured_name": NS, "gstin": NS,
-                                  "policy_class": {"type": "string", "enum": ["Fire", "Burglary", "Other"]},
-                                  "period_from": NS, "period_to": NS, "prev_policy_no": NS, "stock_sum_insured_rs": NN,
-                                  "stock_build_up": NS, "excluded_items": NS, "first_loss_percent": NN}},
-        "stock": {"type": "object", "additionalProperties": False, "required": ["as_on_date", "total_stock_lakh", "creditors_lakh", "debtors_lakh"],
-                  "properties": {"as_on_date": NS, "total_stock_lakh": NN, "creditors_lakh": NN, "debtors_lakh": NN}},
-    },
-}
-AI_PROMPT = """You are transcribing one document from an Indian bank stock-audit file. Identify doc_type and fill ONLY that section;
-leave every other section with null values and an empty transactions list. Copy figures exactly as printed - never estimate,
-never calculate a missing value; use null when a value is not printed.
-- bank_statement: every transaction row in order, date as DD-MM-YYYY, debit/credit as positive rupee numbers (null when blank),
-  balance as printed with a minus sign if it is a debit/overdrawn balance (Dr). Include opening balance if printed.
-- gstr1 / gstr3b: GSTIN, tax period month (1-12) and year, filing/ARN date DD-MM-YYYY. taxable_value = total taxable value of
-  outward supplies only (GSTR-3B table 3.1(a); GSTR-1 all outward supply tables net of credit/debit notes) - never tax amounts.
-- insurance_policy: dates DD-MM-YYYY. stock_sum_insured_rs = sum insured for STOCK ONLY (raw material, WIP, finished goods,
-  stock in trade), in rupees, added across locations; null if no stock sum insured is printed. Do not count building, plant &
-  machinery, furniture, other contents, cash, loss of profit. stock_build_up: the line items you added, e.g. "RM 1,50,00,000 +
-  FG 85,00,000". excluded_items: other items with values. first_loss_percent only if printed.
-- stock_statement: as_on_date DD-MM-YYYY, total stock / inventory, unpaid trade creditors and book debts, converted to Rs lakh
-  only if the document states its unit (lakh/lacs as printed; rupees / 100000)."""
-
-
-def ai_read(path, F, log):
-    """Send one unrecognised file to Claude and merge what it transcribes into F."""
-    import anthropic
-    fn = os.path.basename(path); ext = fn.lower().rsplit(".", 1)[-1]
-    data = open(path, "rb").read()
-    if ext == "pdf":
-        block = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": base64.standard_b64encode(data).decode()}}
-    elif ext in ("jpg", "jpeg", "png"):
-        mt = "image/png" if ext == "png" else "image/jpeg"
-        block = {"type": "image", "source": {"type": "base64", "media_type": mt, "data": base64.standard_b64encode(data).decode()}}
-    else:
-        rows = xlsx_rows(path) if ext in ("xlsx", "xlsm") else [l.rstrip("\n").split(",") for l in open(path, encoding="utf-8", errors="replace")]
-        block = {"type": "text", "text": "\n".join("\t".join("" if c is None else str(c) for c in r) for r in rows)[:400000]}
-    client = anthropic.Anthropic()
-    try:
-        with client.beta.messages.stream(
-            model=AI_MODEL, max_tokens=64000,
-            betas=["server-side-fallback-2026-07-01"], fallbacks="default",
-            output_config={"effort": "medium", "format": {"type": "json_schema", "schema": AI_SCHEMA}},
-            messages=[{"role": "user", "content": [block, {"type": "text", "text": AI_PROMPT}]}],
-        ) as stream:
-            msg = stream.get_final_message()
-    except anthropic.APIStatusError as e:
-        log.append(("AI ERROR", fn, "API %s: %s" % (e.status_code, str(e.message)[:150]))); return
-    except anthropic.APIConnectionError as e:
-        log.append(("AI ERROR", fn, "cannot reach Claude API: %s" % e)); return
-    if msg.stop_reason in ("refusal", "max_tokens"):
-        log.append(("AI ERROR", fn, "stopped: %s" % msg.stop_reason)); return
-    j = json.loads(next(b.text for b in msg.content if b.type == "text"))
-    k = j["doc_type"]
-    if k == "bank_statement":
-        b = j["bank"]; tx = []; prev = b["opening_balance"]; bad = 0
-        for r in b["transactions"]:
-            dd = d(r["date"] or "")
-            if not dd:
-                continue
-            amt = (r["credit"] or 0) - (r["debit"] or 0)
-            if prev is not None and r["balance"] is not None and abs(prev + amt - r["balance"]) > 0.5:
-                bad += 1
-            prev = r["balance"] if r["balance"] is not None else prev
-            tx.append(dict(date=dd, narr=r["narration"], amt=round(amt, 2), bal=r["balance"], src="AI:" + fn))
-        acc = b["account_no"] or fn
-        F["bank"].setdefault(acc, []).extend(tx)
-        log.append(("AI bank", fn, "%d txns; running-balance check: %s" % (len(tx), "OK" if not bad else "%d ROWS DO NOT TIE - check" % bad)))
-    elif k in ("gstr1", "gstr3b") and j["gst"]["taxable_value"] is not None and j["gst"]["period_month"]:
-        g = j["gst"]; fd = d(g["filing_date"] or "")
-        r = dict(kind="1" if k == "gstr1" else "3B", gstin=g["gstin"] or "", ym=(int(g["period_year"]), int(g["period_month"])),
-                 taxable=g["taxable_value"], arn=fd.strftime("%d/%m/%Y") if fd else "")
-        F["g1" if k == "gstr1" else "g3"].append(r)
-        log.append(("AI GSTR-" + r["kind"], fn, "%d-%02d taxable %s" % (r["ym"] + (r["taxable"],))))
-    elif k == "insurance_policy" and j["policy"]["policy_no"]:
-        p = j["policy"]
-        fr, to = d(p["period_from"] or ""), d(p["period_to"] or "")
-        if not (fr and to):
-            log.append(("AI policy", fn, "period not readable - not used")); return
-        pol = dict(file=fn, no=p["policy_no"], frm=fr.strftime("%d/%m/%Y"), to=to.strftime("%d/%m/%Y"), insured=p["insured_name"] or "",
-                   gstin=p["gstin"] or "", prev=p["prev_policy_no"] or "", insurer=p["insurer"] or "",
-                   first_loss=int(p["first_loss_percent"]) if p["first_loss_percent"] else None,
-                   stock=(p["stock_sum_insured_rs"] / 1e5) if p["stock_sum_insured_rs"] else None,
-                   build="AI-read: " + (p["stock_build_up"] or "stock SI not printed"), excluded=p["excluded_items"] or "",
-                   cls=p["policy_class"] if p["policy_class"] != "Other" else "Fire")
-        F["policies"] = [x for x in F["policies"] if x["no"] != pol["no"]] + [pol]
-        F["names"].add(pol["insured"])
-        log.append(("AI policy " + pol["cls"], fn, "%s %s-%s stock SI %s" % (pol["no"], pol["frm"], pol["to"], pol["stock"])))
-    elif k == "stock_statement" and j["stock"]["total_stock_lakh"] is not None:
-        s = j["stock"]; dd = d(s["as_on_date"] or "")
-        if dd:
-            F["ss"].append(dict(date=dd, stock=s["total_stock_lakh"], creditors=s["creditors_lakh"], debtors=s["debtors_lakh"]))
-            log.append(("AI stock statement", fn, "%s stock %s lakh" % (dd, s["total_stock_lakh"])))
-    else:
-        log.append(("AI skipped", fn, "not a bank / GST / policy / stock document"))
-
-
 # ---------------- web portal ----------------
 import uuid, tempfile, shutil, html, secrets, functools, time, webbrowser, threading
 from flask import Flask, request, send_file, session, redirect
@@ -749,11 +631,9 @@ APP.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 APP.config["MAX_CONTENT_LENGTH"] = 400 * 1024 * 1024
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")          # set on the live server; local runs need no login
 HOSTED = bool(os.environ.get("RENDER") or os.environ.get("HOSTED"))
-AI_ON = bool(os.environ.get("ANTHROPIC_API_KEY"))
 STORE = {}                                                  # tok -> dict(F, log, paths, tmp, t)
 OUTDIR = os.path.join(tempfile.gettempdir(), "audit_portal_out") if HOSTED else \
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "Output")
-AI_HINT = re.compile(r"bank|statement|stmt|a/c|account|policy|insur|fire|burglar|gstr|gst|stock|ss\b|sum insured", re.I)
 CSS = """<style>body{font-family:Segoe UI,Arial;margin:0;background:#f4f6f9;color:#1d2733}main{max-width:1100px;margin:auto;padding:24px 16px}
 h1{font-size:22px}h2{font-size:17px;margin-top:28px}.card{background:#fff;border:1px solid #dde3ea;border-radius:8px;padding:18px;margin:14px 0}
 label{display:block;font-weight:600;margin:12px 0 4px}input[type=text],input[type=password],textarea{width:100%;box-sizing:border-box;padding:8px;border:1px solid #c8d0da;border-radius:6px;font:inherit}
@@ -821,7 +701,7 @@ def home():
 <label>- or pick individual files</label><input type=file name=files2 multiple>
 <p class=small>Used: PDF, TXT, XLSX, XLS, CSV (photos are skipped automatically). Nothing is kept after the Excel is made.</p>
 <button>Read documents</button></form></div>
-<p class=small>AI fallback for unknown or scanned files: <b>%s</b>%s</p>
+<p class=small>Rules only - every figure comes from a fixed rule on the document. %s</p>
 <script>
 document.getElementById('up').addEventListener('submit', async e => {
   const f = e.target, ok = /\\.(pdf|txt|xlsx|xlsm|xls|csv)$/i, fd = new FormData();
@@ -830,7 +710,7 @@ document.getElementById('up').addEventListener('submit', async e => {
   e.preventDefault(); document.getElementById('busy').style.display='block';
   const r = await fetch('/read', {method:'POST', body:fd}); document.open(); document.write(await r.text()); document.close();
 });
-</script>""" % (folder, "ON" if AI_ON else "OFF (no ANTHROPIC_API_KEY)", " &nbsp; <a href=/logout>log out</a>" if ADMIN_PASSWORD else ""))
+</script>""" % (folder, "<a href=/logout>log out</a>" if ADMIN_PASSWORD else ""))
 
 
 @APP.post("/read")
@@ -859,19 +739,17 @@ def review(tok):
     S = STORE[tok]; F = S["F"]; log = S["log"]
     gst = sorted({r["gstin"] for r in F["g1"] + F["g3"]})
     borrower = next(iter(sorted(n for n in F["names"] if n)), "")
-    done = {b for a, b, c in log if a.startswith("AI")}
-    unk = [(b, c) for a, b, c in log if a == "skipped" and b not in done and b.lower().rsplit(".", 1)[-1] in ("pdf", "xlsx", "xlsm", "csv", "jpg", "jpeg", "png")]
-    unk += [(p["file"], "policy read, but stock SI not in the text layer (scanned part)") for p in F["policies"]
-            if p["stock"] is None and p["file"] not in done]
-    lg = "".join("<tr><td>%s</td><td>%s</td><td class=%s>%s</td></tr>" % (esc(a), esc(b), "bad" if a in ("skipped", "ERROR", "AI ERROR") or "NOT TIE" in c else "ok", esc(c)) for a, b, c in log)
+    unk = [(b, c) for a, b, c in log if a == "skipped" and b.lower().rsplit(".", 1)[-1] in ("pdf", "xlsx", "xlsm", "xls", "csv")]
+    unk += [(p["file"], "policy read, but stock SI not in the text layer (scanned part) - type it in the policy table below")
+            for p in F["policies"] if p["stock"] is None]
+    lg = "".join("<tr><td>%s</td><td>%s</td><td class=%s>%s</td></tr>" % (esc(a), esc(b), "bad" if a in ("skipped", "ERROR") else "ok", esc(c)) for a, b, c in log)
     ai = ""
     if unk:
-        rows = "".join("<tr><td><input type=checkbox name=f value=\"%s\" %s></td><td>%s</td><td class=small>%s</td></tr>" % (
-            esc(b), "checked" if AI_HINT.search(b) else "", esc(b), esc(c)) for b, c in unk)
-        ai = """<div class=card><h2>Files the rules could not read (%d)</h2>
-<p class=small>Tick the ones that are bank statements, GST returns, insurance policies or stock statements and let AI read them. Leave photos, ITR, audit reports unticked.</p>
-<form method=post action=/ai><input type=hidden name=tok value=%s><div class=wrap><table><tr><th></th><th>File</th><th>Why</th></tr>%s</table></div>
-<button %s>Read ticked files with AI</button>%s</form></div>""" % (len(unk), tok, rows, "" if AI_ON else "disabled", "" if AI_ON else " <span class=bad>AI is off - set ANTHROPIC_API_KEY</span>")
+        rows = "".join("<tr><td>%s</td><td class=small>%s</td></tr>" % (esc(b), esc(c)) for b, c in unk)
+        ai = """<div class=card><h2>Not read by any rule (%d)</h2>
+<p class=small>If any of these is a bank statement, GST return, policy or stock statement, its figures are NOT in the Excel.
+Send that file format to be added as a rule, or type the policy SI below.</p>
+<div class=wrap><table><tr><th>File</th><th>Why</th></tr>%s</table></div></div>""" % (len(unk), rows)
     pol = "".join("""<tr><td>%s<input type=hidden name=pno value="%s"></td><td>%s</td><td>%s to %s</td><td><input name=psi value="%s"></td>
 <td><input name=pfl value="%s"></td><td class=small>%s</td><td class=small>%s</td></tr>""" % (
         esc(p["no"]), esc(p["no"]), esc(p["cls"]), esc(p["frm"]), esc(p["to"]), "" if p["stock"] is None else p["stock"],
@@ -895,22 +773,6 @@ Debtor names: %d &nbsp; Creditor names: %d &nbsp; Directors (MCA): %s</div>%s
         banks, len(F["g1"]), len(F["g3"]), esc(", ".join(gst)), len(F["ss"]), len(F["book"]), len(F["policies"]),
         len(F["debtors"]), len(F["creditors"]), esc(", ".join(F["directors"]) or "none"), ai, tok, esc(borrower),
         esc(gst[0] if gst else ""), esc("\n".join(F["directors"])), pol, lg))
-
-
-@APP.post("/ai")
-def ai():
-    S = STORE.get(request.form.get("tok", ""))
-    if S is None:
-        return page("<h1>Session expired</h1><a href=/>Start again</a>")
-    for fn in request.form.getlist("f")[:40]:
-        p = S["paths"].get(fn)
-        if p:
-            try:
-                ai_read(p, S["F"], S["log"])
-            except Exception as e:
-                S["log"].append(("AI ERROR", fn, repr(e)[:150]))
-    S["t"] = time.time()
-    return review(request.form["tok"])
 
 
 @APP.post("/make")
