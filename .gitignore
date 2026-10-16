@@ -5,3 +5,4 @@ Output/
 .env
 config.json
 .claude/
+!docs/template.xlsx
