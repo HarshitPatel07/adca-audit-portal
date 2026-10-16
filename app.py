@@ -182,7 +182,10 @@ def make():
     cfg = dict(own=own, borrower=own[0] if own else "", gstin=request.form.get("gstin", "").strip(), related=lines("related"), extra=extra)
     os.makedirs(OUTDIR, exist_ok=True)
     out = os.path.join(OUTDIR, "%s - GST Insurance Summation %s.xlsx" % (re.sub(r"[^\w .-]", "", cfg["borrower"] or "Borrower")[:60].strip(), dt.datetime.now().strftime("%Y%m%d-%H%M%S")))
-    build_excel(F, cfg, out)
+    fr, to = default_period(F)
+    cfg.update(banks=[(b.split(",")[0].strip(), num(b.split(",")[1])) for b in lines("banks") if "," in b], sum_from=fr, sum_to=to,
+               visit=extra[0]["date"] if extra else None, visit_stock=extra[0]["stock"] if extra else None)
+    build_excel_draft(F, cfg, out)          # same layout as the live site (user's draft: summation, Insurance, GST)
     data = io.BytesIO(open(out, "rb").read())
     if HOSTED:                                   # nothing stays on the server
         os.remove(out)
@@ -203,7 +206,9 @@ if __name__ == "__main__":
         own = sorted(n for n in F["names"] if n); gst = sorted({r["gstin"] for r in F["g1"] + F["g3"]})
         rel = F["directors"] + (sys.argv[3].split(";") if len(sys.argv) > 3 else [])
         os.makedirs(OUTDIR, exist_ok=True); out = os.path.join(OUTDIR, "cli_test.xlsx")
-        build_excel(F, dict(own=own, borrower=own[0] if own else "", gstin=gst[0] if gst else "", related=rel, extra=[]), out)
+        fr, to = default_period(F)
+        build_excel_draft(F, dict(own=own, borrower=own[0] if own else "", gstin=gst[0] if gst else "", related=rel, extra=[],
+                                  banks=[], sum_from=fr, sum_to=to), out)
         print("WROTE", out)
     else:
         port = int(os.environ.get("PORT", 5055))

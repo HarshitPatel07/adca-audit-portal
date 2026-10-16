@@ -13,7 +13,8 @@ async function boot() {
     await py.pyimport("micropip").install(["openpyxl"]);
     const code = await (await fetch("core.py", {cache: "no-cache"})).text();
     py.FS.writeFile("/core.py", code);
-    py.runPython("import sys; sys.path.insert(0, '/'); import core");
+    py.FS.writeFile("/template.xlsx", new Uint8Array(await (await fetch("template.xlsx", {cache: "no-cache"})).arrayBuffer()));
+    py.runPython("import sys; sys.path.insert(0, '/'); import core; core.TEMPLATE = '/template.xlsx'");
     status("Ready. Pick the Working folder.");
     $("readBtn").disabled = false;
   } catch (e) { status("Could not load the reader: " + e, true); console.error(e); }
@@ -108,6 +109,9 @@ function showReview(s) {
     Stock statements: ${s.ss} &nbsp; Book stock: ${s.book} &nbsp; Policies: ${s.npol}<br>
     Debtor names: ${s.debtors} &nbsp; Creditor names: ${s.creditors} &nbsp; Directors (MCA): ${esc(s.directors.join(", ") || "none")}`;
   $("own").value = s.borrower; $("gstin").value = s.gstins[0] || ""; $("related").value = s.directors.join("\n");
+  $("from").value = (s.period || [])[0] || ""; $("to").value = (s.period || [])[1] || "";
+  $("coll").value = s.collateral ?? "";
+  $("banks").addEventListener("input", checkWarnings);
   $("unreadCard").hidden = !s.unread.length; $("nUnread").textContent = s.unread.length;
   $("unread").innerHTML = "<tr><th>File</th><th>Why</th></tr>" + s.unread.map(u => `<tr><td>${esc(u[0])}</td><td class="small">${esc(u[1])}</td></tr>`).join("");
   $("pol").innerHTML = "<tr><th>Policy</th><th>Class</th><th>Period</th><th>Stock SI (lakh)</th><th>First loss %</th><th>Build-up</th><th>File</th></tr>" +
@@ -149,11 +153,13 @@ function checkWarnings() {
   $("polWarn").textContent = b.length ? `${b.length} polic${b.length > 1 ? "ies have" : "y has"} no stock SI: ${b.join("; ")}. ` +
     "Every date in that period will show 'SI not stated'. Type the stock SI (lakh) from the policy schedule." : "";
   $("relWarn").hidden = !onlyDirectors();
+  $("bankWarn").hidden = !!$("banks").value.trim();
 }
 
 function confirmGenerate() {
   const msgs = [], b = blankPolicies();
   if (b.length) msgs.push(`- ${b.length} policy stock SI blank: ${b.join("; ")}`);
+  if (!$("banks").value.trim()) msgs.push("- Banks and sanctioned limits are blank (summation sheet needs them).");
   if (onlyDirectors()) msgs.push("- Related parties: only the MCA directors are listed. Have you added the related parties from the balance sheet note?");
   return !msgs.length || confirm("Before generating, please check:\n\n" + msgs.join("\n\n") + "\n\nOK = generate anyway, Cancel = go back and fill them.");
 }
@@ -162,7 +168,8 @@ function makeExcel(skipCheck) {
   if (skipCheck !== true && !confirmGenerate()) return;
   const pol = {};
   document.querySelectorAll("#pol tr[data-no]").forEach(r => pol[r.dataset.no] = {si: r.querySelector(".si").value, fl: r.querySelector(".fl").value});
-  const form = {own: $("own").value, gstin: $("gstin").value, related: $("related").value, extra: $("extra").value, pol};
+  const form = {own: $("own").value, gstin: $("gstin").value, related: $("related").value, extra: $("extra").value, pol,
+                banks: $("banks").value, from: $("from").value, to: $("to").value, pm: $("pm").value, coll: $("coll").value};
   try {
     status("Making the Excel...");
     const name = py.globals.get("core").browser_make(JSON.stringify(form), "/out.xlsx");

@@ -30,8 +30,15 @@
       <label>Borrower GSTIN</label><input type="text" id="gstin">
       <label>Directors / partners / related parties - their credits are excluded (one per line; add the related-party note of the audited balance sheet)</label><textarea id="related"></textarea>
       <p class="warn" id="relWarn">Only the MCA directors are listed. Add every related party from the audited balance sheet's related-party note (associate / group companies, relatives) - otherwise their credits are counted as debtor receipts.</p>
-      <label>Extra dates for insurance (visit date etc.): one per line as dd-mm-yyyy, label, stock in lakh (stock optional)</label>
+      <label>Banks and sanctioned limits (Rs lakh) - one per line, the bank of the statements first</label>
+      <textarea id="banks" placeholder="Axis Bank, 590&#10;Union Bank, 450"></textarea>
+      <p class="warn" id="bankWarn">Type the sanctioned limits - the summation sheet's proportionate DP and realization % need them.</p>
+      <label>Summation period (from month - to month)</label>
+      <div class="two"><input type="text" id="from" placeholder="Jan-2026"><input type="text" id="to" placeholder="Jun-2026"></div>
+      <label>Visit date for insurance (first line is the visit row): dd-mm-yyyy, label, stock in lakh (stock optional)</label>
       <textarea id="extra" placeholder="30-09-2026, Visit date 30-09-2026, 117.13"></textarea>
+      <label>Plant &amp; Machinery value as per audited balance sheet (Rs lakh) and collateral insurable value (Rs lakh)</label>
+      <div class="two"><input type="text" id="pm" placeholder="P&amp;M net block e.g. 425.13"><input type="text" id="coll" placeholder="Collateral value e.g. 331.065"></div>
       <h3>Policies - correct the stock SI (lakh) or first-loss % if blank or wrong</h3>
       <p class="warn" id="polWarn" hidden></p>
       <p class="ocrwarn" id="ocrWarn" hidden></p>

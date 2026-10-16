@@ -294,6 +294,51 @@ def mca_directors(rows):
 
 # ---------------- insurance ----------------
 def policy(t, fname):
+    p = _policy(t, fname)
+    if p:
+        _policy_details(t.replace("\n", "|"), p)
+    return p
+
+
+BANK_NAMES = (r"\b(?:AXIS BANK|STATE BANK OF INDIA|UNION BANK OF INDIA|BANK OF INDIA|BANK OF BARODA|BANK OF MAHARASHTRA|"
+              r"CENTRAL BANK OF INDIA|PUNJAB NATIONAL BANK|PUNJAB & SIND BANK|CANARA BANK|INDIAN OVERSEAS BANK|INDIAN BANK|UCO BANK|"
+              r"HDFC BANK|ICICI BANK|KOTAK MAHINDRA BANK|IDBI BANK|YES BANK|INDUSIND BANK|FEDERAL BANK|IDFC FIRST BANK|RBL BANK|"
+              r"SARASWAT BANK|COSMOS BANK|KARUR VYSYA BANK|SOUTH INDIAN BANK|CITY UNION BANK|DCB BANK|BANDHAN BANK|AU SMALL FINANCE BANK)"
+              r"(?:\s*(?:LTD|LIMITED)\.?)?(?:\s*,\s*[A-Z]{3,15})?")
+
+
+def _policy_details(f, p):
+    """Nature of the policy, financier (bank) and insured address - shown in the Insurance sheet blocks."""
+    m = re.search(r"Undertaking\)\|([^|]{6,90})", f) or \
+        re.search(r"(INDUSTRIAL ALL RISK[^|]{0,40}|BURGLARY[^|]{0,40}INSURANCE[^|]{0,20}|STANDARD FIRE[^|]{0,40}|BHARAT [^|]{0,40})", f, re.I)
+    p["nature"] = m.group(1).strip() if m else p["cls"]
+    # financier: known bank names after the financier / hypothecation label (several banks are joined)
+    banks = []
+    for mk in re.finditer(r"Financier|Hypothecation|Bank Details|HP-|Hypo\b|Agreed Bank|Bank Clause|Interest of", f, re.I):
+        seg = f[mk.start():mk.start() + 400]
+        for bm in re.finditer(BANK_NAMES, seg, re.I):
+            nm = re.sub(r"\s+", " ", bm.group(0)).upper().strip(" .,")
+            if nm not in banks:
+                banks.append(nm)
+        if banks:
+            break
+    p["bank"] = " & ".join(banks)
+    loc = None
+    for rx in (r"Location (?:Details|address)\s*\|?\s*(?:with Pin Code\s*\|)?\s*:?\s*((?:[^|]{3,120}\|){1,3}?)(?=First Loss|Occupancy|Risk|Ris\||Building|Type|Location|Sum|\d{6}\d{6})",
+               r"(?:Insured Address|Risk Location Address|Mailing Address of the Insured\s*:?)\s*\|?\s*:?\s*((?:[^|]{3,120}\|){1,4}?)(?=Policy|Phone|PAN|GSTIN|Bank|Mobile|E-?mail|Are you|Occupancy|Product)",
+               r"\|Address\s*\|?\s*:?\s*\|?\s*:?\s*((?:[^|]{2,80}\|){1,5}?)(?=GSTIN|Phone|PAN|Mobile|E-?mail|Address)"):
+        for m2 in re.finditer(rx, f, re.I):
+            cand = re.sub(r"\s+", " ", m2.group(1).replace("|", " ")).strip(" ,:.")
+            if len(cand) >= 15 and re.search(r"\d", cand) and "@" not in cand:
+                loc = cand; break
+        if loc:
+            break
+    p["location"] = loc or ""
+    if "items" not in p:
+        p["items"] = [("Stock", p["stock"])] if p["stock"] is not None else []
+
+
+def _policy(t, fname):
     f = t.replace("\n", "|")
     if not re.search(r"NEW INDIA ASSURANCE", f[:20000], re.I):      # other insurers: label-value rules below
         return policy_generic(f, fname) if re.search(r"Policy\s*(No|Number)", f, re.I) else None
@@ -336,6 +381,9 @@ def policy(t, fname):
                     + " = %g lakh (Block Details)" % p["stock"]
                 p["excluded"] = "Building %g; FFF %g; P&M %g; Other contents %g (lakh)" % tuple(
                     sum(b[k] for b in blocks) / 1e5 for k in (0, 1, 2, 3))
+                tot = lambda k: sum(b[k] for b in blocks) / 1e5
+                p["items"] = [("Building", tot(0)), ("Furniture & Fittings", tot(1)), ("Plant and Machinery", tot(2)),
+                              ("Stock", p["stock"]), ("Other Contents", tot(3))]
         if p["stock"] is None:
             s = re.search(r"\|Stocks?[^|]{0,60}\|(?:[^|]{0,40}\|)?([\d,]{6,})\|", f)
             if s:
@@ -464,7 +512,9 @@ def policy_generic(f, fname):
         m = re.search(r"\|(" + lab + r")[^|]{0,40}\|" + AMT + r"\|", f, re.I)
         if m and num(m.group(2)) > 0:
             ex.append("%s %.2f" % (m.group(1)[:30], num(m.group(2)) / 1e5))
+            p.setdefault("items", []).append((m.group(1).strip()[:30], num(m.group(2)) / 1e5))
     p["excluded"] = "; ".join(ex) + (" (lakh)" if ex else "")
+    p["items"] = p.get("items", []) + ([("Stock", p["stock"])] if p["stock"] is not None else [])
     return p
 
 
@@ -574,9 +624,93 @@ def company_stock_statement(t):
                 creditors=amt(r"Unpaid Stock\s*/?\s*Creditor"), debtors=amt(r"Total Book Debts"), split=None, check=True)
 
 
+# ---------------- statutory dues: PF (EPFO), ESIC, electricity bills ----------------
+def pf_receipt(t):
+    """EPFO payment confirmation / TRRN details: wage month, total amount, date of payment."""
+    f = t.replace("\n", "|")
+    if "Wage Month" not in f or "TRRN" not in f:
+        return None
+    wm = re.search(r"\|([A-Z]{3}-\d{2,4})\|Wage Month", f) or re.search(r"Wage Month\s*:?\|?\s*([A-Z]{3}-\d{2,4})", f)
+    am = re.search(r"\|([\d,]+)\|Total Amount \(Rs\)", f) or re.search(r"Total Amount \(Rs\)\s*:?\|?\s*([\d,]+)", f)
+    pd_ = re.search(r"(?:Payment Confirmation Date|Date of Credit|Realization Date)\s*:?\|?:?\|?\s*(\d{2}-[A-Z]{3}-\d{4})", f)
+    if not (wm and am):
+        return None
+    m = re.match(r"([A-Z]{3})-(\d{2,4})", wm.group(1)); y = int(m.group(2)); y = y + 2000 if y < 100 else y
+    return dict(kind="PF", ym=(y, MON[m.group(1).lower()]), amount=num(am.group(1)), paid=d(pd_.group(1).title()) if pd_ else None)
+
+
+def esic_receipt(t):
+    """ESIC online challan status: challan period, amount paid, submitted (paid) date."""
+    f = t.replace("\n", "|")
+    if "ESIC" not in f or "Challan Period" not in f:
+        return None
+    per = re.search(r"Challan Period:?\|?\s*([A-Za-z]{3})-(\d{4})", f)
+    am = re.search(r"Amount Paid:?\|?\s*([\d,]+(?:\.\d+)?)", f)
+    sub = re.search(r"Challan Submitted Date\|?\s*(\d{2}-\d{2}-\d{4})", f) or re.search(r"Challan Created Date\|?\s*(\d{2}-\d{2}-\d{4})", f)
+    if not (per and am):
+        return None
+    return dict(kind="ESIC", ym=(int(per.group(2)), MON[per.group(1).lower()]), amount=num(am.group(1)), paid=d(sub.group(1)) if sub else None)
+
+
+def electricity_bill(t):
+    """Electricity (HT) bill: bill month, net payable, due date, and the previous month's payment (date, amount)."""
+    f = t.replace("\n", "|")
+    bm = re.search(r"Bill month\s*:?\|?\s*([A-Za-z]+)-(\d{4})", f)
+    if not bm or not re.search(r"VIDYUT|ELECTRICITY|POWER|Energy Charges", f, re.I):
+        return None
+    names = [dt.date(2000, i, 1).strftime("%B").lower() for i in range(1, 13)]
+    if bm.group(1).lower() not in names:
+        return None
+    net = re.search(r"NET BILL PAYABLE\|([\d,]+\.\d\d)", f)
+    due = re.search(r"Last Dates? Of Payment\|(?:1\. By Online\|)?(\d{2}-[A-Z]{3}-\d{4})", f)
+    pay = re.search(r"Last Month Payment Details.*?Amt \(Rs\.\)\|(\d{2}-[A-Z]{3}-\d{4})\|[^|]*\|[^|]*\|([\d,]+(?:\.\d+)?)", f)
+    return dict(ym=(int(bm.group(2)), names.index(bm.group(1).lower()) + 1), net=num(net.group(1)) if net else None,
+                due=d(due.group(1).title()) if due else None,
+                prev_paid=d(pay.group(1).title()) if pay else None, prev_amount=num(pay.group(2)) if pay else None)
+
+
+def mca_dins(rows):
+    """[(DIN/PAN, name)] of directors from the MCA master data sheet."""
+    out = []
+    for i, r in enumerate(rows):
+        low = [str(c or "").lower().strip() for c in r]
+        if "name" in low and "designation" in low:
+            ni, di = low.index("name"), low.index("designation")
+            ki = next((j for j, c in enumerate(low) if c in ("din/pan", "din", "din / pan")), None)
+            for rr in rows[i + 1:]:
+                if len(rr) > di and rr[di] and "director" in str(rr[di]).lower():
+                    out.append((str(rr[ki]).strip() if ki is not None and rr[ki] is not None else "", str(rr[ni]).strip()))
+            break
+    return out
+
+
+def tally_group_total(rows, head):
+    """Tally Sundry Debtors / Creditors group summary (Excel): Grand Total net (debit - credit), dated by the period end.
+    Creditors: credit balances only (debit-balance suppliers are advances, not creditors)."""
+    if re.search(r"Transactions", head, re.I):
+        for r in rows:
+            if r and str(r[0] or "").strip() == "Grand Total":
+                v = [c for c in r[1:] if isinstance(c, (int, float))]
+                return dict(date=tally_end(head), dr=v[-1], cr=0.0, closing_only=True) if v else None
+        return None
+    di = ci = None
+    for r in rows[:20]:
+        low = [str(c or "").strip().lower() for c in r]
+        if "debit" in low and "credit" in low:
+            di, ci = low.index("debit"), low.index("credit")
+    if di is None:
+        return None
+    for r in rows:
+        if r and str(r[0] or "").strip() == "Grand Total":
+            val = lambda j: float(r[j]) if j < len(r) and isinstance(r[j], (int, float)) else 0.0
+            return dict(date=tally_end(head), dr=val(di), cr=val(ci))
+    return None
+
+
 # ---------------- scan everything ----------------
 def scan(paths, log):
-    F = dict(bank={}, g1=[], g3=[], ss=[], book=[], debtors=set(), creditors=set(), directors=[], policies=[], names=set())
+    F = dict(bank={}, g1=[], g3=[], ss=[], book=[], debtors=set(), creditors=set(), directors=[], policies=[], names=set(),
+             pf=[], esic=[], elec=[], dins=[], deb_tot=[], cred_tot=[])
     for p in paths:
         fn = os.path.basename(p); ext = fn.lower().rsplit(".", 1)[-1] if "." in fn else ""
         try:
@@ -612,6 +746,17 @@ def scan(paths, log):
                     elif stock_month_table(t):
                         r = stock_month_table(t); F["book"].extend(r)
                         log.append(("Book stock", fn, "%d month-ends from a monthly stock table (PDF)" % len(r)))
+                    elif re.search(r"1ST CHG ON IMMOVABLE PROP", t, re.I):
+                        v = [num(x) for x in re.findall(r"1ST CHG ON IMMOVABLE PROP[^\n|]*?(\d{5,})", t, re.I)]
+                        F["collateral"] = dict(value=sum(v), count=len(v))
+                        log.append(("Collateral", fn, "%d properties, insured value %s (bank's list)" % (len(v), sum(v))))
+                    elif pf_receipt(t):
+                        r = pf_receipt(t); F["pf"].append(r); log.append(("PF", fn, "%d-%02d Rs %s paid %s" % (r["ym"] + (r["amount"], r["paid"]))))
+                    elif esic_receipt(t):
+                        r = esic_receipt(t); F["esic"].append(r); log.append(("ESIC", fn, "%d-%02d Rs %s paid %s" % (r["ym"] + (r["amount"], r["paid"]))))
+                    elif electricity_bill(t):
+                        r = electricity_bill(t); F["elec"].append(r)
+                        log.append(("Electricity bill", fn, "%d-%02d net payable %s; previous month paid %s on %s" % (r["ym"] + (r["net"], r["prev_amount"], r["prev_paid"]))))
                     elif policy(t, fn):
                         r = policy(t, fn); F["policies"].append(r); F["names"].add(r["insured"])
                         log.append(("Policy " + r["cls"], fn, "%s %s-%s stock SI %s" % (r["no"], r["frm"], r["to"], r["stock"])))
@@ -638,13 +783,17 @@ def scan(paths, log):
                     if r: F["book"].append(r); log.append(("Book stock", fn, "%s %s lakh" % (r["date"], r["stock"])))
                 elif k == "Sundry Debtors":
                     F["debtors"].update(tally_names(rows)); log.append(("Debtor ledger", fn, "names read"))
+                    tt = tally_group_total(rows, head)
+                    if tt and tt["date"]: F["deb_tot"].append(tt)
                 elif k == "Sundry Creditors":
                     F["creditors"].update(tally_names(rows)); log.append(("Creditor ledger", fn, "names read"))
+                    tt = tally_group_total(rows, head)
+                    if tt and tt["date"]: F["cred_tot"].append(tt)
                 elif tally_sales(rows, head):
                     r = tally_sales(rows, head); F.setdefault("sales", {}).update(r)
                     log.append(("Books sales", fn, "%d months (sales net of returns)" % len(r)))
                 elif mca_directors(rows):
-                    F["directors"] = mca_directors(rows); log.append(("MCA", fn, ", ".join(F["directors"])))
+                    F["directors"] = mca_directors(rows); F["dins"] = mca_dins(rows); log.append(("MCA", fn, ", ".join(F["directors"])))
                 else:
                     acc, tx = bank_table(rows)
                     if tx:
@@ -1094,6 +1243,290 @@ def build_insurance(wb, F, cfg):
 
 
 
+# ================= Excel in the user's own layout (docs/template.xlsx = blank copy of the human draft) =================
+TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "template.xlsx")
+
+
+def _ym_add(ym, k):
+    y, m = ym; m += k
+    while m < 1: m += 12; y -= 1
+    while m > 12: m -= 12; y += 1
+    return (y, m)
+
+
+def _mlab(ym):
+    return dt.date(ym[0], ym[1], 1).strftime("%b'%y")
+
+
+def _lakh(v):
+    return None if v is None else round(v / 1e5, 5)
+
+
+def _is_cc(tx):
+    bals = sorted(t["bal"] for t in tx if t.get("bal") is not None)
+    return bool(bals) and bals[len(bals) // 2] < 0          # overdrawn most of the time -> cash credit
+
+
+def _book_total(rows, ym, creditors=False):
+    """Books debtors (debit - credit) or creditors (credit balances) at a month end, Rs."""
+    for r in rows:
+        if r["date"] == month_end(*ym):
+            return r["cr"] if creditors else r["dr"] - r["cr"]
+    return None
+
+
+def _short_bank(name):
+    """'Axis Bank Ltd' / 'AXIS BANK' / 'Axis' -> 'Axis';  'Union Bank of India' -> 'Union'"""
+    w = re.sub(r"(?i)\b(bank|ltd\.?|limited|of india)\b", " ", name or "").split()
+    return w[0].title() if w else (name or "")
+
+
+def draft_summation(ws, F, cfg, allc):
+    base = cfg["sum_to"]; start = cfg["sum_from"]
+    months = [];  ym = start
+    while ym <= base:
+        months.append(ym); ym = _ym_add(ym, 1)
+    per = "%s To %s" % (_mlab(start), _mlab(base))
+    banks = cfg.get("banks") or []
+    bank1 = banks[0][0] if banks else "Bank"
+    accs = sorted(F["bank"].items(), key=lambda kv: -len(kv[1]))
+    cc = next((a for a, tx in accs if _is_cc(dedupe(tx))), accs[0][0] if accs else "")
+    ca = next((a for a, tx in accs if a != cc), None)
+    inp = lambda t: start <= (t["date"].year, t["date"].month) <= base
+
+    def sums(acc):
+        if acc is None:
+            return None, None
+        tx = [t for t in dedupe(F["bank"][acc]) if inp(t)]
+        dr = sum(-t["amt"] for t in tx if t["amt"] < 0)
+        rec = sum(r["amt"] for r in allc if r["acc"] == acc and r["b"] == "INC" and inp(r))   # debtor receipts only
+        return _lakh(dr), _lakh(rec)
+
+    ws["B2"] = " Cash Credit A/C %s Bank: %s   " % (_short_bank(bank1), cc)
+    ws["F2"] = " Current A/C %s Bank: %s" % (_short_bank(bank1), ca or "")
+    for c, v in (("B3", "Period"), ("C3", "Debit Summation"), ("D3", "Credit Summation"),
+                 ("F3", "Period"), ("G3", "Debit Summation"), ("H3", "Credit Summation")):
+        ws[c] = v
+    ws["B4"] = per; ws["C4"], ws["D4"] = sums(cc)
+    if ca:
+        ws["F4"] = per; ws["G4"], ws["H4"] = sums(ca)
+    ws["B5"] = "Total"; ws["C5"] = "=SUM(C4:C4)"; ws["D5"] = "=SUM(D4:D4)"
+    ws["F5"] = "Total"; ws["G5"] = "=SUM(G4:G4)"; ws["H5"] = "=SUM(H4:H4)"
+    ws["B9"] = "Particulars"; ws["C9"] = "Amount (In lakhs)"
+    opening = _book_total(F.get("deb_tot", []), _ym_add(start, -1))
+    closing = _book_total(F.get("deb_tot", []), base)
+    g3 = {r["ym"]: r["taxable"] for r in F["g3"]} or {r["ym"]: r["taxable"] for r in F["g1"]}
+    sales = sum(g3.get(m, 0) for m in months) if all(m in g3 for m in months) else None
+    ws["B10"] = "Opening Debtors as on %s" % dt.date(start[0], start[1], 1).strftime("%d-%m-%Y"); ws["C10"] = _lakh(opening)
+    ws["B11"] = "Add: Sales during %s" % per; ws["C11"] = _lakh(sales)
+    ws["B12"] = "Less: Closing Debtors as on %s" % month_end(*base).strftime("%d-%m-%Y"); ws["C12"] = _lakh(closing)
+    ws["B13"] = "Sales Realization during %s" % per; ws["C13"] = "=C10+C11-C12"
+    b2 = banks[1] if len(banks) > 1 else ("", None)
+    sh1 = _short_bank(bank1); sh2 = _short_bank(b2[0]) if b2[0] else "other"
+    ws["B14"] = "Limit Sanctioned (%s bank)" % sh1; ws["C14"] = banks[0][1] if banks else None
+    ws["B15"] = "Limit Sanctioned (%s bank)" % sh2; ws["C15"] = b2[1] if b2[1] is not None else 0
+    ws["B16"] = "Total Limit Sanctioned"; ws["C16"] = "=C14+C15"
+    ws["B17"] = "Proportionate DP for %s Bank Ltd." % sh1; ws["C17"] = "=C14*C13/C16"
+    ws["B18"] = "Proportionate DP for %s Bank Ltd." % sh2; ws["C18"] = "=C13*C15/C16"
+    ws["B19"] = "Routed In %s – CC" % sh1; ws["C19"] = "=D5"
+    ws["B20"] = "Routed In %s – CA" % sh1; ws["C20"] = "=H5" if ca else 0
+    ws["B21"] = "Total Receipt In %s" % sh1; ws["C21"] = "=C19+C20"
+    ws["B22"] = "Sales Realization in %"; ws["C22"] = "=C21/C17%"
+
+
+def _pol_block(ws, col, top, p, items):
+    """One policy block of the draft layout (5 columns starting at col, starting row top)."""
+    L = openpyxl.utils.get_column_letter
+    c = lambda k: L(openpyxl.utils.column_index_from_string(col) + k)
+    if p is None:
+        return
+    bank = re.split(r"\s*[,&]\s*", p.get("bank") or "")[0].strip(" .")
+    ws["%s%d" % (c(0), top)] = "Issued by: %s" % (p.get("insurer") or "")
+    ws["%s%d" % (c(3), top)] = "Nature:  %s" % re.sub(r"\s*\([^)]*\)", "", p.get("nature") or p["cls"]).strip()
+    ws["%s%d" % (c(0), top + 1)] = "Bank Clause: %s" % ("Included in the policy" if bank else "Not stated in the policy")
+    ws["%s%d" % (c(3), top + 1)] = "Period:  From: %s To: %s" % (p["frm"], p["to"])
+    ws["%s%d" % (c(0), top + 2)] = ("Interest of %s Bank: Included & Endorsed in favour of  %s " % (_short_bank(bank), bank)
+                                    if bank else "Interest of Bank: Not stated in the policy")
+    ws["%s%d" % (c(0), top + 3)] = "Policy No"; ws["%s%d" % (c(1), top + 3)] = "Risk Covered"
+    ws["%s%d" % (c(2), top + 3)] = "SI (Rs in lakh)"; ws["%s%d" % (c(4), top + 3)] = "Location covered:"
+    ws["%s%d" % (c(0), top + 4)] = p["no"]; ws["%s%d" % (c(4), top + 4)] = p.get("location") or ""
+    for i, (lab, v) in enumerate(items):
+        ws["%s%d" % (c(1), top + 4 + i)] = lab
+        ws["%s%d" % (c(2), top + 4 + i)] = round(v, 2) if isinstance(v, (int, float)) else "SI not stated"
+
+
+def draft_insurance(ws, F, cfg):
+    pols = {}
+    for p in F["policies"]:
+        if p["cls"] == "Other":
+            continue
+        q = pols.get(p["no"])
+        if q is None or (q["stock"] is None and p["stock"] is not None):
+            pols[p["no"]] = p
+    fire = sorted((p for p in pols.values() if p["cls"] == "Fire"), key=lambda p: pdate(p["frm"]), reverse=True)
+    burg = sorted((p for p in pols.values() if p["cls"] == "Burglary"), key=lambda p: pdate(p["frm"]), reverse=True)
+    fitems = lambda p: [(k, p["stock"] if k == "Stock" else v) for k, v in (p.get("items") or [("Stock", p["stock"])])][:5]
+    _pol_block(ws, "B", 1, fire[0] if fire else None, fitems(fire[0]) if fire else [])
+    _pol_block(ws, "H", 1, fire[1] if len(fire) > 1 else None, fitems(fire[1]) if len(fire) > 1 else [])
+    _pol_block(ws, "B", 12, burg[0] if burg else None, [("Stock", burg[0]["stock"])] if burg else [])
+    _pol_block(ws, "H", 12, burg[1] if len(burg) > 1 else None, [("Stock", burg[1]["stock"])] if len(burg) > 1 else [])
+    # stock vs insured: the last three stock-statement dates up to the summation end month + the visit date
+    base = month_end(*cfg["sum_to"])
+    books = {b["date"]: b["stock"] for b in F["book"] if b.get("date")}
+    ss = {s["date"]: s for s in F["ss"] if s.get("date")}
+    dates = sorted(x for x in ss if x <= base)[-3:]
+    visit = cfg.get("visit") or max([x for x in books if x > base] or [None], key=lambda x: x or dt.date.min)
+    for c, v in (("B20", "Month"), ("C20", "Total Stock"), ("D20", "Insured Amt (Fire)"), ("E20", "Insured Amt (Burglary)"), ("F20", "Remarks")):
+        ws[c] = v
+    use = list(pols.values())
+    rows = [(x, _mlab((x.year, x.month))) for x in dates] + ([(visit, "Visit date %s" % visit.strftime("%d-%m-%Y"))] if visit else [])
+    for i, (day, lab) in enumerate(rows[:4]):
+        r = 21 + i
+        stock = books.get(day)
+        if stock is None and day in ss:
+            stock = ss[day]["stock"]
+        if stock is None and cfg.get("visit_stock") is not None and day == visit:
+            stock = cfg["visit_stock"]
+        fp, _ = cover(use, "Fire", day); bp, _ = cover(use, "Burglary", day)
+        fsi = fp["stock"] if fp and fp["stock"] is not None else ("SI not stated" if fp else "Policy not provided")
+        bsi = bp["stock"] if bp and bp["stock"] is not None else ("SI not stated" if bp else "Policy not provided")
+        ws["B%d" % r] = lab; ws["C%d" % r] = round(stock, 2) if stock is not None else None
+        ws["D%d" % r] = fsi; ws["E%d" % r] = bsi
+        short = []
+        sub, sp = (fp or {}).get("sub"), (ss.get(day) or {}).get("split")
+        if sub and sp:
+            short = [k for k in ("RM", "WIP", "FG") if (sp.get(k) or 0) > (sub.get(k) or 0)]
+        if stock is None or not isinstance(fsi, (int, float)):
+            rem = "Unable to comment"
+        elif stock > fsi or (isinstance(bsi, (int, float)) and stock > bsi) or short:
+            rem = "Inadequately Insured" + (" (%s sub-limit)" % "/".join(short) if short and stock <= fsi else "")
+        else:
+            rem = "Adequately Insured"
+        ws["F%d" % r] = rem
+    # fixed assets and collateral as in the draft: insured value from the current fire policy; asset values typed on the portal
+    ws["B27"] = "Fixed asset schedule"
+    for c, v in (("B28", "Particulars"), ("C28", "Assets value (Rs. Lakhs)"), ("D28", "Insured Value (Rs. In Lakhs)"), ("E28", "Remarks")):
+        ws[c] = v
+    it = dict((k.lower(), v) for k, v in (fire[0].get("items") or [])) if fire else {}
+    pm = next((v for k, v in it.items() if "plant" in k), None)
+    bld = next((v for k, v in it.items() if "building" in k), None)
+    ws["B29"] = "Plant & Machinery"; ws["C29"] = cfg.get("pm_value"); ws["D29"] = round(pm, 2) if pm is not None else None
+    if cfg.get("pm_value") is not None and pm is not None:
+        ws["E29"] = "Adequately Insured" if pm >= cfg["pm_value"] else "Inadequately Insured"
+    for c, v in (("B31", "Address of collateral"), ("C31", "Assets value (Rs. Lakhs)"), ("D31", "Insured Value (Rs. In Lakhs)"), ("E31", "Remarks")):
+        ws[c] = v
+    ws["B32"] = cfg.get("collateral_address") or (fire[0].get("location") if fire else "")
+    cv = cfg.get("collateral_value")
+    if cv is None and F.get("collateral"):
+        cv = round(F["collateral"]["value"] / 1e5, 5)
+    ws["C32"] = cv; ws["D32"] = round(bld, 2) if bld is not None else None
+    cfg = dict(cfg, collateral_value=cv)
+    if cfg.get("collateral_value") is not None and bld is not None:
+        ws["E32"] = "Adequately Insured" if bld >= cfg["collateral_value"] else "Inadequately Insured"
+
+
+GST_STATES = {"01": "Jammu and Kashmir", "02": "Himachal Pradesh", "03": "Punjab", "04": "Chandigarh", "05": "Uttarakhand",
+              "06": "Haryana", "07": "Delhi", "08": "Rajasthan", "09": "Uttar Pradesh", "10": "Bihar", "11": "Sikkim",
+              "12": "Arunachal Pradesh", "13": "Nagaland", "14": "Manipur", "15": "Mizoram", "16": "Tripura", "17": "Meghalaya",
+              "18": "Assam", "19": "West Bengal", "20": "Jharkhand", "21": "Odisha", "22": "Chhattisgarh", "23": "Madhya Pradesh",
+              "24": "Gujarat", "26": "Dadra and Nagar Haveli and Daman and Diu", "27": "Maharashtra", "29": "Karnataka", "30": "Goa",
+              "32": "Kerala", "33": "Tamil Nadu", "34": "Puducherry", "36": "Telangana", "37": "Andhra Pradesh", "38": "Ladakh"}
+
+
+def _fy(ym):
+    y = ym[0] if ym[1] >= 4 else ym[0] - 1
+    return "%d-%d" % (y, y + 1)
+
+
+def _mname(ym):
+    return dt.date(ym[0], ym[1], 1).strftime("%B")
+
+
+def _ret_rows(ws, rows, col, top, kind, n):
+    L = openpyxl.utils.get_column_letter; c0 = openpyxl.utils.column_index_from_string(col)
+    for i, r in enumerate(sorted(rows, key=lambda r: r["ym"], reverse=True)[:n]):
+        y, m = r["ym"]; due = dt.date(y + (m == 12), m % 12 + 1, 20 if kind == "3B" else 11)
+        fd = d(r["arn"]) if r.get("arn") else None
+        vals = [_fy(r["ym"]), _mname(r["ym"]), due, fd, ("Timely Filed" if fd <= due else "Late Filed") if fd else "Filing date not found"]
+        for k, v in enumerate(vals):
+            ws["%s%d" % (L(c0 + k), top + i)] = v
+
+
+def _due_rows(ws, rows, col, top, label, n):
+    L = openpyxl.utils.get_column_letter; c0 = openpyxl.utils.column_index_from_string(col)
+    for i, r in enumerate(sorted(rows, key=lambda r: r["ym"], reverse=True)[:n]):
+        y, m = r["ym"]; due = dt.date(y + (m == 12), m % 12 + 1, 15)
+        rem = ("Timely Paid" if r["paid"] <= due else "Lately Paid") if r.get("paid") else "Payment date not found"
+        for k, v in enumerate([label, _mname(r["ym"]), r["amount"], r.get("paid"), rem]):
+            ws["%s%d" % (L(c0 + k), top + i)] = v
+
+
+def draft_gst(ws, F, cfg):
+    gst = cfg.get("gstin") or next(iter(sorted({r["gstin"] for r in F["g1"] + F["g3"]})), "")
+    st = GST_STATES.get(gst[:2], "")
+    ws["B1"] = "GSTIN:  %s(%s)" % (gst, st)
+    for c, v in zip("BCDEF", ("Financial Year", "Tax Period", "Due Date", "Date of filing", "Remarks")):
+        ws["%s2" % c] = v
+    _ret_rows(ws, [r for r in F["g3"] if not gst or r["gstin"] == gst], "B", 3, "3B", 6)
+    for c, v in zip("JKLMN", ("Particulars", "Month", "Amount (Rs.)", "Date Paid", "Remarks")):
+        ws["%s2" % c] = v; ws["%s10" % c] = v
+    # GST challans: no rule reads them yet - the month rows are left for the auditor
+    for c, v in zip("BCDEF", ("Particulars", "Month", "Amount (Rs.)", "Date Paid", "Remarks")):
+        ws["%s10" % c] = v
+    _due_rows(ws, F.get("pf", []), "B", 11, "PF", 6)
+    _due_rows(ws, F.get("esic", []), "J", 11, "ESIC", 6)
+    for c, v in zip("BCDEF", ("Particulars", "Tax Period", "Amount (Rs.)", "Date Paid", "Remarks")):
+        ws["%s18" % c] = v
+    # electricity: the payment of month M is printed on the bill of month M+1 ("Last Month Payment Details")
+    ws["B24"] = "Payment Details of Electricity Bill (For last 12 month):"
+    bills = {b["ym"]: b for b in F.get("elec", [])}
+    if bills:
+        last = max(bills)
+        for blk, top in ((0, 25), (1, 29)):
+            ws["B%d" % top] = "Month"; ws["B%d" % (top + 1)] = "Date"; ws["B%d" % (top + 2)] = "Amount"
+            for i in range(6):
+                ym = _ym_add(last, -(blk * 6 + i)); col = "CDEFGH"[i]
+                ws["%s%d" % (col, top)] = _mlab(ym)
+                nxt = bills.get(_ym_add(ym, 1))
+                if nxt and nxt.get("prev_paid"):
+                    ws["%s%d" % (col, top + 1)] = nxt["prev_paid"]; ws["%s%d" % (col, top + 2)] = nxt["prev_amount"]
+    ws["J19"] = "GSTIN:  %s(%s) - GSTR-1" % (gst, st)
+    for c, v in zip("JKLMN", ("Financial Year", "Tax Period", "Due Date", "Date of filing", "Remarks")):
+        ws["%s20" % c] = v
+    _ret_rows(ws, [r for r in F["g1"] if (not gst or r["gstin"] == gst) and r["ym"] <= cfg["sum_to"]], "J", 21, "1", 7)
+    ws["J31"] = "Sr. No"; ws["K31"] = "DIN/PAN"; ws["L31"] = "Name of Directors"
+    dins = F.get("dins") or [("", n) for n in F.get("directors", [])]
+    for i, (din, nm) in enumerate(dins):
+        ws["J%d" % (32 + i)] = str(i + 1); ws["K%d" % (32 + i)] = din; ws["L%d" % (32 + i)] = nm
+
+
+def build_excel_draft(F, cfg, out):
+    """Workbook in the user's own layout: summation, Insurance, GST (template = blank copy of their draft)."""
+    allc = []
+    for acc, tx in F["bank"].items():
+        for r in classify(dedupe(tx), F, cfg["related"], cfg["own"]):
+            r["acc"] = acc; allc.append(r)
+    wb = openpyxl.load_workbook(TEMPLATE)
+    draft_summation(wb["summation"], F, cfg, allc)
+    draft_insurance(wb["Insurance"], F, cfg)
+    draft_gst(wb["GST"], F, cfg)
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for c in row:
+                if isinstance(c.value, dt.date):
+                    c.number_format = "DD-MM-YYYY"
+    wb.save(out)
+    return allc
+
+
+def default_period(F):
+    """Summation period: six months ending at the latest stock-statement month (the drawing-power base)."""
+    ss = [s["date"] for s in F["ss"] if s.get("date")]
+    end = max(ss) if ss else max((t["date"] for tx in F["bank"].values() for t in tx), default=dt.date.today())
+    to = (end.year, end.month)
+    return _ym_add(to, -5), to
+
+
 # ---------------- browser (GitHub Pages / Pyodide) entry points ----------------
 _B = {}
 
@@ -1118,6 +1551,8 @@ def browser_summary():
         banks=[[k, len(v)] for k, v in F["bank"].items()], g1=len(F["g1"]), g3=len(F["g3"]), gstins=gst,
         ss=len(F["ss"]), book=len(F["book"]), npol=len(F["policies"]), debtors=len(F["debtors"]), creditors=len(F["creditors"]),
         directors=F["directors"], borrower=next(iter(sorted(n for n in F["names"] if n)), ""), books_sales=len(F.get("sales", {})),
+        period=[dt.date(y, m, 1).strftime("%b-%Y") for y, m in default_period(F)],
+        collateral=round(F["collateral"]["value"] / 1e5, 5) if F.get("collateral") else None,
         policies=[dict(no=p["no"], cls=p["cls"], frm=p["frm"], to=p["to"], stock=p["stock"], fl=p["first_loss"], build=p["build"],
                        file=p["file"], ocr=bool(p.get("ocr"))) for p in F["policies"]],
         unread=unk, log=log))
@@ -1226,6 +1661,17 @@ def browser_make(form_json, out):
             extra.append(dict(date=d(parts[0]), label=parts[1] if len(parts) > 1 and parts[1] else None,
                               stock=num(parts[2]) if len(parts) > 2 and parts[2] else None))
     own = lines(f.get("own"))
-    cfg = dict(own=own, borrower=own[0] if own else "", gstin=(f.get("gstin") or "").strip(), related=lines(f.get("related")), extra=extra)
-    build_excel(F, cfg, out)
+    banks = []
+    for l in lines(f.get("banks")):
+        parts = [x.strip() for x in re.split(r"[,:]", l)]
+        if parts and parts[0]:
+            banks.append((parts[0], num(parts[1]) if len(parts) > 1 and parts[1] else None))
+    fr, to = default_period(F)
+    pf = lambda k, dflt: (lambda m: (int(m.group(2)) + (2000 if int(m.group(2)) < 100 else 0), MON[m.group(1)[:3].lower()]) if m else dflt)(
+        re.match(r"\s*([A-Za-z]{3,9})[\s'-]*(\d{2,4})", f.get(k) or ""))
+    fl = lambda k: num(f[k]) if str(f.get(k) or "").strip() else None
+    cfg = dict(own=own, borrower=own[0] if own else "", gstin=(f.get("gstin") or "").strip(), related=lines(f.get("related")), extra=extra,
+               banks=banks, sum_from=pf("from", fr), sum_to=pf("to", to), pm_value=fl("pm"), collateral_value=fl("coll"),
+               visit=extra[0]["date"] if extra else None, visit_stock=extra[0]["stock"] if extra else None)
+    build_excel_draft(F, cfg, out)
     return re.sub(r"[^\w .-]", "", cfg["borrower"] or "Borrower")[:60].strip()
