@@ -1675,3 +1675,77 @@ def browser_make(form_json, out):
                visit=extra[0]["date"] if extra else None, visit_stock=extra[0]["stock"] if extra else None)
     build_excel_draft(F, cfg, out)
     return re.sub(r"[^\w .-]", "", cfg["borrower"] or "Borrower")[:60].strip()
+
+
+# Month-wise GST taxable-value summary added after the existing user-format workbook is built.
+def _add_gst_taxable_summary(wb, F):
+    rows_by_gstin = collections.defaultdict(dict)
+    invalid = []
+    duplicates = 0
+    for r in F.get("g1", []):
+        gstin = str(r.get("gstin") or "").strip().upper()
+        if not re.fullmatch(r"[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]", gstin):
+            invalid.append((gstin or "(blank)", r.get("ym"), r.get("arn", "")))
+            continue
+        ym = r.get("ym")
+        if not ym or not isinstance(r.get("taxable"), (int, float)):
+            invalid.append((gstin, ym, "Missing period or taxable value"))
+            continue
+        previous = rows_by_gstin[gstin].get(ym)
+        if previous is None:
+            rows_by_gstin[gstin][ym] = r
+        else:
+            # A duplicate file for this return period counts once; keep the latest ARN copy.
+            duplicates += 1
+            old_arn = d(previous.get("arn", "")) if previous.get("arn") else None
+            new_arn = d(r.get("arn", "")) if r.get("arn") else None
+            if new_arn and (not old_arn or new_arn > old_arn):
+                rows_by_gstin[gstin][ym] = r
+    months = sorted({ym for by_month in rows_by_gstin.values() for ym in by_month},
+                    key=lambda ym: (ym[0] if ym[1] >= 4 else ym[0] - 1, (ym[1] - 4) % 12))
+    ws = wb.create_sheet("GST Taxable Summary")
+    headers = ["GSTIN"] + [_mname(ym) + "-" + str(ym[0]) for ym in months] + ["Total"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+        cell.fill = openpyxl.styles.PatternFill("solid", fgColor="173B38")
+        cell.alignment = openpyxl.styles.Alignment(wrap_text=True)
+    for gstin in sorted(rows_by_gstin):
+        values = [round(float(rows_by_gstin[gstin][ym]["taxable"]), 2) if ym in rows_by_gstin[gstin] else 0.0 for ym in months]
+        ws.append([gstin] + values + [round(sum(values), 2)])
+    grand = [round(sum(float(by_month[ym]["taxable"]) for by_month in rows_by_gstin.values() if ym in by_month), 2) for ym in months]
+    ws.append(["Grand Total"] + grand + [round(sum(grand), 2)])
+    for cell in ws[ws.max_row]:
+        cell.font = openpyxl.styles.Font(bold=True, color="173B38")
+        cell.fill = openpyxl.styles.PatternFill("solid", fgColor="EAF4F1")
+    ws.freeze_panes = "B2"
+    ws.auto_filter.ref = ws.dimensions
+    for col in ws.columns:
+        width = min(22, max(14, max(len(str(cell.value or "")) for cell in col) + 2))
+        ws.column_dimensions[col[0].column_letter].width = width
+    for row in ws.iter_rows(min_row=2, min_col=2):
+        for cell in row:
+            cell.number_format = "#,##0.00"
+    ws.append(["Basis: filed GSTR-1 taxable value by return tax period. Reported debit/credit notes and amendments are included in each filed-period net amount; tax columns are excluded."])
+    ws.cell(ws.max_row, 1).font = openpyxl.styles.Font(italic=True, color="66736D")
+    ws.merge_cells(start_row=ws.max_row, start_column=1, end_row=ws.max_row, end_column=max(1, len(headers)))
+    review = wb.create_sheet("GST Summary Review")
+    review.append(["Check", "Count", "Details"])
+    review.append(["Duplicate GSTIN-period return skipped", duplicates, "Each return period is included once; latest ARN copy retained when available."])
+    review.append(["Invalid or incomplete GSTR-1 return", len(invalid), "; ".join("%s %s %s" % item for item in invalid)[:30000]])
+    for cell in review[1]:
+        cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+        cell.fill = openpyxl.styles.PatternFill("solid", fgColor="173B38")
+    review.column_dimensions["A"].width = 38
+    review.column_dimensions["B"].width = 14
+    review.column_dimensions["C"].width = 100
+    review.freeze_panes = "A2"
+
+
+_build_excel_draft_without_taxable_summary = build_excel_draft
+def build_excel_draft(F, cfg, out):
+    allc = _build_excel_draft_without_taxable_summary(F, cfg, out)
+    wb = openpyxl.load_workbook(out)
+    _add_gst_taxable_summary(wb, F)
+    wb.save(out)
+    return allc
