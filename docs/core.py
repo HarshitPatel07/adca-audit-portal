@@ -1749,3 +1749,14 @@ def build_excel_draft(F, cfg, out):
     _add_gst_taxable_summary(wb, F)
     wb.save(out)
     return allc
+
+
+# Keep the required MMM-YYYY month label in the GST summary.
+_add_gst_taxable_summary_full_month = _add_gst_taxable_summary
+def _add_gst_taxable_summary(wb, F):
+    _add_gst_taxable_summary_full_month(wb, F)
+    months = sorted({r["ym"] for r in F.get("g1", []) if r.get("ym") and isinstance(r.get("taxable"), (int, float))},
+                    key=lambda ym: (ym[0] if ym[1] >= 4 else ym[0] - 1, (ym[1] - 4) % 12))
+    ws = wb["GST Taxable Summary"]
+    for col, ym in enumerate(months, 2):
+        ws.cell(1, col).value = dt.date(ym[0], ym[1], 1).strftime("%b-%Y")
