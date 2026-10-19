@@ -38,8 +38,12 @@ async function readDocs() {
     rmTree("/work"); py.FS.mkdir("/work");
     for (let i = 0; i < files.length; i++) {
       status(`Copying file ${i + 1} of ${files.length} into the reader...`);
-      py.FS.mkdir("/work/" + i);
-      py.FS.writeFile(`/work/${i}/${files[i].name}`, new Uint8Array(await files[i].arrayBuffer()));
+      // keep the file's folders (Invoices/Sales bill, Invoices/purchases ...) - the invoice rules read the folder name
+      const rel = (files[i].webkitRelativePath || files[i].name).split("/").slice(1, -1)
+        .map(x => x.replace(/[^\w .&'()-]/g, "_")).filter(Boolean);
+      let dir = "/work/" + i; py.FS.mkdir(dir);
+      for (const part of rel) { dir += "/" + part; if (!py.FS.analyzePath(dir).exists) py.FS.mkdir(dir); }
+      py.FS.writeFile(`${dir}/${files[i].name}`, new Uint8Array(await files[i].arrayBuffer()));
     }
     status(`Reading ${files.length} files...`);
     await new Promise(r => setTimeout(r, 30));
@@ -87,7 +91,7 @@ async function runOCR(s) {
       const blob = new Blob([py.FS.readFile("/ocr.png")], {type: "image/png"});
       await worker.setParameters({tessedit_pageseg_mode: "3", tessedit_char_whitelist: ""});
       const r = await worker.recognize(blob, {}, {blocks: true, text: true});
-      text += r.data.text + "\n";
+      text += (pg ? "\n\f\n" : "") + r.data.text;   // pages separated by a form feed (one invoice per page)
       const lines = (r.data.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines));
       for (const label of cand.fields) {
         if (fields[label]) continue;
@@ -120,6 +124,16 @@ function showReview(s) {
       <td class="small">${esc(p.build)}</td><td class="small">${esc(p.file)}</td></tr>`).join("");
   $("log").innerHTML = "<tr><th>Read as</th><th>File</th><th>Result</th></tr>" + s.log.map(l =>
     `<tr><td>${esc(l[0])}</td><td>${esc(l[1])}</td><td class="${["skipped", "ERROR"].includes(l[0]) || /BREAKS|CHECK/.test(l[2]) ? "bad" : "ok"}">${esc(l[2])}</td></tr>`).join("");
+  const iv = (x, k) => `<input class="i-${k}" value="${esc(x[k] ?? "")}">`;
+  $("inv").innerHTML = "<tr><th>Type</th><th>Invoice No.</th><th>Date</th><th>Party</th><th>Item</th><th>UOM</th><th>Qty</th><th>Rate</th><th>File (page)</th></tr>" +
+    (s.invoices || []).map(x => `<tr data-id="${esc(x.id)}" data-kind="${esc(x.kind)}" class="${x.unread ? "missing" : (x.ocr ? "ocr" : "")}">
+      <td>${esc(x.kind)}</td><td>${iv(x, "no")}</td><td>${iv(x, "date")}</td><td>${iv(x, "party")}</td><td>${iv(x, "item")}</td>
+      <td>${iv(x, "uom")}</td><td>${iv(x, "qty")}</td><td>${iv(x, "rate")}</td>
+      <td class="small">${esc(x.file)} (p.${x.page})${x.unread ? " - not readable, type it from the scan" : (x.ocr ? " - OCR, check" : "")}</td></tr>`).join("");
+  const unreadInv = (s.invoices || []).filter(x => x.unread);
+  $("invWarn").hidden = !unreadInv.length;
+  $("invWarn").textContent = unreadInv.length ? `${unreadInv.length} invoice page(s) could not be read (handwritten / scanned): ` +
+    unreadInv.map(x => `${x.file} p.${x.page}`).join(", ") + ". Type Invoice No., Date, Party, Item, UOM, Qty and Rate from the scan." : "";
   const ocrp = s.policies.filter(p => p.ocr).map(p => p.no);
   $("ocrWarn").hidden = !ocrp.length;
   $("ocrWarn").textContent = ocrp.length ? `Read from a scanned page by OCR - check against the policy before generating: ${ocrp.join(", ")} (amber rows).` : "";
@@ -168,7 +182,13 @@ function makeExcel(skipCheck) {
   if (skipCheck !== true && !confirmGenerate()) return;
   const pol = {};
   document.querySelectorAll("#pol tr[data-no]").forEach(r => pol[r.dataset.no] = {si: r.querySelector(".si").value, fl: r.querySelector(".fl").value});
-  const form = {own: $("own").value, gstin: $("gstin").value, related: $("related").value, extra: $("extra").value, pol,
+  const inv = {};
+  document.querySelectorAll("#inv tr[data-id]").forEach(r => {
+    const e = {kind: r.dataset.kind};
+    for (const k of ["no", "date", "party", "item", "uom", "qty", "rate"]) e[k] = r.querySelector(".i-" + k).value;
+    inv[r.dataset.id] = e;
+  });
+  const form = {own: $("own").value, gstin: $("gstin").value, related: $("related").value, extra: $("extra").value, pol, inv,
                 banks: $("banks").value, from: $("from").value, to: $("to").value, pm: $("pm").value, coll: $("coll").value};
   try {
     status("Making the Excel...");

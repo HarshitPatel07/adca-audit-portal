@@ -728,9 +728,161 @@ def tally_group_total(rows, head):
     return None
 
 
+# ---------------- invoices (Invoice sheet) ----------------
+INV_UNITS = r"KGS?|NOS?\.?|PCS|PES|MT|MTS|LTRS?|LITRES?|BAGS?|BOXES|BOX|SETS?|UNITS?|QTL|TONS?|MTRS?|SQM|SQFT|ROLLS?|DOZ"
+INV_DATE = r"(\d{1,2}-[A-Za-z]{3}-\d{2,4}|\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})"
+CO_WORDS = r"\b(?:Pvt|Private|Ltd|Limited|LLP|Industries|Enterprises|Traders|Trading|Corporation|Company|Plastics?|Polymers?|Packaging)\b"
+
+
+def pdf_pages(p):
+    try:
+        with pymupdf.open(p) as doc:
+            return [pg.get_text() for pg in doc]
+    except Exception:
+        return []
+
+
+def _inv_nums(s):
+    return [num(x) for x in re.findall(r"\d[\d,]*(?:\.\d+)?", s)]
+
+
+def _uom(u):
+    u = u.rstrip(".").title()
+    return "Pcs" if u == "Pes" else u          # OCR reads 'pcs' as 'pes'; the qty x rate proof still applies
+
+
+def invoice_page(t, own_names=(), kind_hint=""):
+    """One tax-invoice page -> dict(no, date, party, item, uom, qty, rate) or None.
+    Text-layer Tally PDFs print the item row reversed ('1 Item | Amount | per | Rate | Qty UNIT'); OCR keeps reading order.
+    Quantity x rate must equal an amount printed on the page (to the rupee), so a misread figure is never used.
+    A page that is an invoice but whose item row cannot be proved returns dict(unread=True)."""
+    if not re.search(r"Tax\s*Invoice|Invoice\s*No", t, re.I):
+        return None
+    f = re.sub(r"[ \t]+", " ", t)
+    amounts = [round(v, 2) for v in _inv_nums(f) if v >= 100]
+    # first item row: from the '1' serial after the goods header to the tax lines / total
+    hdr = re.search(r"Description\s*of\s*Goods", f, re.I)
+    body = f[hdr.end():] if hdr else f
+    row = re.search(r"(?:^|[\n|])\s*1\s*[|)\]]?\s*([A-Za-z][^\n]*?(?:\n[^\n]*?){0,8}?)(?=\n\s*(?:2\s*[|)\]]?\s*[A-Za-z]|OUTPUT|Output|CGST|SGST|IGST|Total|continued))", body)
+    seg = row.group(1) if row else ""
+    tot = re.search(r"\bTotal\b[^\n]{0,60}?(\d[\d,]*\.?\d*)\s*(" + INV_UNITS + r")\b", body, re.I)
+    best = None
+    qtys = [(num(m.group(1)), m.group(2)) for m in re.finditer(r"(\d[\d,]*\.?\d*)\s*(" + INV_UNITS + r")\b", seg, re.I)]
+    if tot:
+        qtys.append((num(tot.group(1)), tot.group(2)))
+    for q, u in qtys:
+        if q <= 0:
+            continue
+        for r in _inv_nums(seg):
+            if r <= 0 or r == q:
+                continue
+            hit = next((a for a in amounts if abs(a - q * r) <= 1.0 and a != q and a != r), None)
+            if hit:
+                best = (q, _uom(u), r); break
+        if best:
+            break
+    item = ""
+    if seg:
+        item = re.split(r"\s*[|]\s*|\s+\d{4,8}\b|\s+HSN\b|\s*\(", seg.split("\n")[0].strip())[0].strip(" :-")
+    # invoice number + date: Tally prints 'Invoice No. | e-Way Bill No. | Dated' with the values below
+    no = dte = None
+    m = re.search(r"Invoice\W{0,2}No\.?.{0,40}?\n(?:.*?\b)?([A-Z]{0,4}/?[0-9][A-Z0-9/\-]{0,18})[\s|]+(?:\d{12}[\s|]+)?" + INV_DATE, f, re.I | re.S)
+    if m and len(m.group(0)) < 260:
+        no, dte = m.group(1), m.group(2)
+    if not no:
+        m = re.search(r"Invoice\s*No\.?\s*\n\s*(?:e-?Way\s*Bill\s*No\.?\s*\n\s*)?([A-Z0-9][A-Z0-9/\-]{0,20})\s*\n", f, re.I)
+        no = m.group(1) if m else None
+        md = re.search(r"Dated\s*\n\s*" + INV_DATE, f, re.I) or re.search(r"Ack\s*Date\s*:?\s*" + INV_DATE, f, re.I)
+        dte = md.group(1) if md else None
+    # names: the company lines at the top (seller first) and the 'Buyer (Bill to)' name; sales / purchase is decided at
+    # build time (folder name, GSTIN, own name), when the borrower's names and GSTIN are known
+    lines = [x.strip(" |") for x in f.split("\n") if x.strip(" |")]
+    cos = [re.split(r"\s+(?:Invoice|\d{4}-\d{2}\b|\()", x)[0].strip(" -") for x in lines
+           if re.search(CO_WORDS, x, re.I) and not re.search(r"IRN|Ack|Invoice\s*$", x)]
+    buyer = re.search(r"Buyer\s*\(Bill\s*to\)\s*\n\s*([^\n]+)", f, re.I)
+    gstins = re.findall(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z])\b", f)
+    x = dict(unread=not best, hint=kind_hint, cos=cos[:6], buyer=buyer.group(1).strip(" |") if buyer else "",
+             seller_gstin=gstins[0] if gstins else "", no=no or "", date=d(dte) if dte else None, item=item,
+             uom=best[1] if best else "", qty=best[0] if best else None, rate=best[2] if best else None)
+    x["party"] = x["buyer"] or (cos[0] if cos else "")          # provisional (page grouping); final in inv_resolve
+    return x
+
+
+def _clean_party(s):
+    s = re.sub(r"^\s*(?:Name|M/s\.?)\s*:?\s*", "", re.sub(r"\s+", " ", s or ""), flags=re.I).strip(" |-")
+    return s[:-1] if s.endswith(".") and s.count(".") == 1 else s     # 'Sevenstar Polytex Pvt Ltd.' -> no stray dot
+
+
+def _looks_garbled(s):
+    """OCR noise in a name ('et"A$'$ vtrRlptgs PVT. LTD.', 'Ci.AFI \\IITRNfIED'): characters a firm name never has,
+    or too few letters. Such a row is shown on the review page to be typed, never written as read."""
+    if not s or re.search(r"[\"$\\\\{}<>~^*=_;!?@#%]", s):
+        return True
+    letters = len(re.findall(r"[A-Za-z]", s))
+    return letters < 4 or letters / max(1, len(s.replace(" ", ""))) < 0.75
+
+
+def inv_resolve(F, own_names, own_gstin):
+    """Final kind and party of every invoice: folder name ('Sales bill' / 'purchases bill') first, then the seller GSTIN,
+    then whether the first company line is the borrower. Sales -> buyer; purchase -> seller (first company line not ours)."""
+    own = [nospace(n.upper())[:12] for n in own_names if n]
+    is_own = lambda s: any(o and o in nospace((s or "").upper()) for o in own)
+    for x in F.get("inv", []):
+        kind = x["hint"] or ("sales" if own_gstin and x["seller_gstin"] == own_gstin else "") \
+            or ("sales" if x["cos"] and is_own(x["cos"][0]) else "purchase")
+        seller = next((c for c in x["cos"] if not is_own(c)), "")
+        x["kind"] = kind
+        x["party"] = x.get("typed_party") or _clean_party(x["buyer"] if kind == "sales" and x["buyer"] else seller)
+        # anything not proven goes to the review page as 'type it': garbled names, impossible dates, no invoice number
+        if not x.get("typed"):
+            bad_date = x["date"] is not None and not (dt.date.today().year - 3 <= x["date"].year <= dt.date.today().year + 1)
+            if bad_date:
+                x["date"] = None
+            if _looks_garbled(x["party"]) or _looks_garbled(x["item"]) or not x["no"] or x["date"] is None:
+                x["unread"] = True
+
+
+def invoice_kind_hint(path):
+    p = path.replace("\\", "/").lower()
+    return "purchase" if "purchase" in p else ("sales" if re.search(r"sale", p) else "")
+
+
+def add_invoices(F, path, pages, ocr=False):
+    """Every invoice page of a file, in page order; a page that only continues the previous invoice is skipped."""
+    hint = invoice_kind_hint(path); fn = os.path.basename(path); got = []
+    for i, t in enumerate(pages):
+        r = invoice_page(t, sorted(F["names"]), hint)
+        if not r or any(re.search(r"INSURANCE|ASSURANCE", c, re.I) for c in r["cos"][:2]):
+            continue                          # an insurer's premium tax invoice is not a trade invoice
+        if not r["unread"] and got and got[-1]["no"] == r["no"] and r["no"]:
+            continue
+        # page 2 / 3 of the same invoice: Tally 'Tax Invoice(Page 2)' and the e-Way Bill page ('Doc No. : Tax Invoice - 857')
+        if r["unread"] and got and (r["no"] == got[-1]["no"] or
+                                    re.search(r"\(\s*Page\s*\d|^\s*e-?Way\s*Bill|Doc\s*No\.?\s*:?\s*Tax\s*Invoice", t[:300], re.I)):
+            continue
+        r.update(file=fn, page=i + 1, ocr=ocr, id="%s#%d" % (fn, i + 1)); got.append(r)
+    F.setdefault("inv", []).extend(got)
+    return got
+
+
+def pick_invoices(F, kind, n=3):
+    """As in the drafts: in file / page order, the first invoice of each new party, up to three.
+    An unread page (handwritten / scanned) stays in its place so the auditor can type it on the review page."""
+    out, seen = [], set()
+    for x in sorted([x for x in F.get("inv", []) if x["kind"] == kind], key=lambda x: (x["file"].lower(), x["page"])):
+        key = nospace((x.get("party") or "").upper())[:14]
+        if x["unread"] or not key:
+            out.append(x)
+        elif key not in seen:
+            seen.add(key); out.append(x)
+        if len(out) == n:
+            break
+    return out
+
+
 # ---------------- scan everything ----------------
 def scan(paths, log):
-    F = dict(bank={}, bank_name={}, g1=[], g3=[], ss=[], book=[], debtors=set(), creditors=set(), directors=[], policies=[], names=set(),
+    F = dict(bank={}, bank_name={}, inv=[], g1=[], g3=[], ss=[], book=[], debtors=set(), creditors=set(), directors=[], policies=[], names=set(),
              pf=[], esic=[], elec=[], dins=[], deb_tot=[], cred_tot=[])
     for p in paths:
         fn = os.path.basename(p); ext = fn.lower().rsplit(".", 1)[-1] if "." in fn else ""
@@ -781,6 +933,9 @@ def scan(paths, log):
                     elif policy(t, fn):
                         r = policy(t, fn); F["policies"].append(r); F["names"].add(r["insured"])
                         log.append(("Policy " + r["cls"], fn, "%s %s-%s stock SI %s" % (r["no"], r["frm"], r["to"], r["stock"])))
+                    elif re.search(r"Tax\s*Invoice|Invoice\s*No", t, re.I) and add_invoices(F, p, pdf_pages(p)):
+                        r = [x for x in F["inv"] if x["file"] == fn]
+                        log.append(("Invoice", fn, "%d invoice(s): %s" % (len(r), ", ".join(x["no"] or "page %d not readable" % x["page"] for x in r))))
                     else:
                         log.append(("skipped", fn, "not recognised" if t.strip() else "no text layer (scanned)"))
             elif ext == "txt":
@@ -896,20 +1051,56 @@ KW = [  # (category, keywords, reason)
 ]
 
 
+def remitter(u):
+    """Remitter of a structured credit 'NEFT/<UTR>/<REMITTER>/<BANK>/<remarks>' (also RTGS, IMPS, INB/RTGS); '' otherwise.
+    Customers often put the borrower's own name in the remarks (Clan: 'NEFT/.../RDENTERPRISE/ICICI BANK/CLANVITRIFIED'),
+    so the own-name test must look at the remitter only."""
+    seg = [x.strip() for x in u.split("/")]
+    i = 1 if seg and seg[0] == "INB" else 0
+    if len(seg) >= i + 3 and re.match(r"^(NEFT|RTGS|IMPS|NEFT-?IN)", seg[i]):
+        return seg[i + 2]
+    if seg and seg[0] == "TRF":               # 'TRF/TAPADIYA TRADERS/clan vitrified pvt ltd', 'TRF/568/ADVANCE COOLING/tran'
+        return next((x for x in seg[1:] if len(re.sub(r"[^A-Z]", "", x)) >= 3), "")
+    return ""
+
+
+def director_keys(names):
+    """Narrations cut a name at ~22 characters ('MAHESHWAR SINGH RANAWA'), so the full name is not enough."""
+    keys = set()
+    for nm in names:
+        w = (nm or "").upper().split()
+        if not w:
+            continue
+        if len(w[-1]) >= 5:
+            keys.add(w[-1])
+        if len(w) >= 3 and len(" ".join(w[:2])) >= 9:
+            keys.add(" ".join(w[:2]))
+        if len(w) >= 2:
+            keys.add(w[0] + " " + w[-1][:5])
+    return sorted(keys, key=len, reverse=True)
+
+
 def classify(tx, F, related, own):
     out = []
     debtors = sorted(F["debtors"], key=len, reverse=True)
     creditors = sorted(F["creditors"])
     deb_first = {toks(dn)[0] for dn in debtors if toks(dn)}
     own_keys = [("".join(toks(nm)), nm) for nm in own if nm and toks(nm)]
+    dkeys = director_keys([nm for nm in related if nm in F.get("directors", [])])
     for t in tx:
         if t["amt"] <= 0:
             continue
         u = t["narr"].upper(); r = dict(t); n = nospace(u)
         hit = None
+        rem = remitter(u)
+        hay = nospace(rem) if rem else n
         for key, nm in own_keys:
-            if key in n:
+            if key in hay:
                 hit = ("EXC", "Self-transfer / contra", "Own name (%s) - transfer from own account" % nm)
+        if not hit:
+            k = next((k for k in dkeys if k in u), None)
+            if k:
+                hit = ("EXC", "Director/Partner/Owner/Related party", "Promoter-director (narration has '%s')" % k)
         if not hit:
             for nm in related:
                 if name_hit(nm, u, n, u):
@@ -1323,8 +1514,10 @@ def draft_summation(ws, F, cfg, allc):
             return None, None
         tx = [t for t in dedupe(F["bank"][acc]) if inp(t)]
         dr = sum(-t["amt"] for t in tx if t["amt"] < 0)
-        rec = sum(r["amt"] for r in allc if r["acc"] == acc and r["b"] == "INC" and inp(r))   # debtor receipts only
-        return _lakh(dr), _lakh(rec)
+        # credits as the drafts total them: every credit, less transfers from own accounts and from directors / related parties
+        ex = sum(r["amt"] for r in allc if r["acc"] == acc and inp(r) and r["cat"].startswith(("Self-transfer", "Director")))
+        cr = sum(t["amt"] for t in tx if t["amt"] > 0) - ex
+        return _lakh(dr), _lakh(cr)
 
     ws["B2"] = " Cash Credit A/C %s Bank: %s   " % (_short_bank(bank1), cc)
     ws["F2"] = " Current A/C %s Bank: %s" % (_short_bank(bank1), ca or "")
@@ -1358,6 +1551,18 @@ def draft_summation(ws, F, cfg, allc):
     ws["B22"] = "Sales Realization in %"; ws["C22"] = "=C21/C17%"
 
 
+def _addr(a):
+    """Policy address as the drafts write it: '..., SANWER ROAD, INDORE 452015' - no repeated town, no state name,
+    town and PIN joined by a space (policies print 'INDORE INDORE ,MADHYA PRADESH, 452015' / 'INDORE-452015')."""
+    a = re.sub(r"\s+", " ", a or "").strip(" ,.")
+    a = re.sub(r"\s*,\s*", ", ", a)
+    a = re.sub(r"\b(\w+)(?:\s+\1\b)+", r"\1", a, flags=re.I)                    # INDORE INDORE -> INDORE
+    states = sorted({v for v in GST_STATES.values() if v}, key=len, reverse=True)
+    a = re.sub(r",\s*(?:%s)\s*(?=,|\s*-?\s*\d{6}\b|$)" % "|".join(re.escape(x) for x in states), "", a, flags=re.I)
+    a = re.sub(r"\s*[,-]\s*(\d{6})\b", r" \1", a)                                # INDORE, 452015 / INDORE-452015
+    return a.strip(" ,")
+
+
 def _pol_block(ws, col, top, p, items):
     """One policy block of the draft layout (5 columns starting at col, starting row top)."""
     L = openpyxl.utils.get_column_letter
@@ -1373,7 +1578,7 @@ def _pol_block(ws, col, top, p, items):
                                     if bank else "Interest of Bank: Not stated in the policy")
     ws["%s%d" % (c(0), top + 3)] = "Policy No"; ws["%s%d" % (c(1), top + 3)] = "Risk Covered"
     ws["%s%d" % (c(2), top + 3)] = "SI (Rs in lakh)"; ws["%s%d" % (c(4), top + 3)] = "Location covered:"
-    ws["%s%d" % (c(0), top + 4)] = p["no"]; ws["%s%d" % (c(4), top + 4)] = p.get("location") or ""
+    ws["%s%d" % (c(0), top + 4)] = p["no"]; ws["%s%d" % (c(4), top + 4)] = _addr(p.get("location"))
     for i, (lab, v) in enumerate(items):
         ws["%s%d" % (c(1), top + 4 + i)] = lab
         ws["%s%d" % (c(2), top + 4 + i)] = round(v, 2) if isinstance(v, (int, float)) else "SI not stated"
@@ -1416,14 +1621,10 @@ def draft_insurance(ws, F, cfg):
         bsi = bp["stock"] if bp and bp["stock"] is not None else ("SI not stated" if bp else "Policy not provided")
         ws["B%d" % r] = lab; ws["C%d" % r] = round(stock, 2) if stock is not None else None
         ws["D%d" % r] = fsi; ws["E%d" % r] = bsi
-        short = []
-        sub, sp = (fp or {}).get("sub"), (ss.get(day) or {}).get("split")
-        if sub and sp:
-            short = [k for k in ("RM", "WIP", "FG") if (sp.get(k) or 0) > (sub.get(k) or 0)]
         if stock is None or not isinstance(fsi, (int, float)):
             rem = "Unable to comment"
-        elif stock > fsi or (isinstance(bsi, (int, float)) and stock > bsi) or short:
-            rem = "Inadequately Insured" + (" (%s sub-limit)" % "/".join(short) if short and stock <= fsi else "")
+        elif stock > fsi or (isinstance(bsi, (int, float)) and stock > bsi):
+            rem = "Inadequately Insured"
         else:
             rem = "Adequately Insured"
         ws["F%d" % r] = rem
@@ -1439,7 +1640,7 @@ def draft_insurance(ws, F, cfg):
         ws["E29"] = "Adequately Insured" if pm >= cfg["pm_value"] else "Inadequately Insured"
     for c, v in (("B31", "Address of collateral"), ("C31", "Assets value (Rs. Lakhs)"), ("D31", "Insured Value (Rs. In Lakhs)"), ("E31", "Remarks")):
         ws[c] = v
-    ws["B32"] = cfg.get("collateral_address") or (fire[0].get("location") if fire else "")
+    ws["B32"] = cfg.get("collateral_address") or (_addr(fire[0].get("location")) if fire else "")
     cv = cfg.get("collateral_value")
     if cv is None and F.get("collateral"):
         cv = round(F["collateral"]["value"] / 1e5, 5)
@@ -1476,6 +1677,24 @@ def _ret_rows(ws, rows, col, top, kind, n):
             ws["%s%d" % (L(c0 + k), top + i)] = v
 
 
+def gst_from_bank(F):
+    """GST cash payments read from the bank statements' debits: {return period: dict(amount, paid)}.
+    A payment made up to the 30th of month M is the return of month M-1 (GSTR-3B due on the 20th).
+    Gold Star: every period ties to the GSTR-3B 'Tax paid in cash' (incl. RCM), e.g. May'26 43,03,092."""
+    res = {}
+    for tx in F["bank"].values():
+        for t in dedupe(tx):
+            u = t["narr"].upper()
+            if t["amt"] >= 0 or not re.search(r"GST\s*(TAX)?\s*PAYMENT|GSTN|GST PMT|GST CHALLAN|CBIC GST", u) \
+                    or re.search(r"ICEGATE|@|CHRG|CHARGE", u):
+                continue
+            ym = (t["date"].year, t["date"].month)
+            ym = _ym_add(ym, -1) if t["date"].day <= 30 else ym
+            g = res.setdefault(ym, dict(amount=0.0, paid=t["date"]))
+            g["amount"] = round(g["amount"] - t["amt"], 2); g["paid"] = max(g["paid"], t["date"])
+    return res
+
+
 def _due_rows(ws, rows, col, top, label, n):
     L = openpyxl.utils.get_column_letter; c0 = openpyxl.utils.column_index_from_string(col)
     for i, r in enumerate(sorted(rows, key=lambda r: r["ym"], reverse=True)[:n]):
@@ -1494,7 +1713,16 @@ def draft_gst(ws, F, cfg):
     _ret_rows(ws, [r for r in F["g3"] if not gst or r["gstin"] == gst], "B", 3, "3B", 6)
     for c, v in zip("JKLMN", ("Particulars", "Month", "Amount (Rs.)", "Date Paid", "Remarks")):
         ws["%s2" % c] = v; ws["%s10" % c] = v
-    # GST challans: no rule reads them yet - the month rows are left for the auditor
+    # GST challans: one row per GSTR-3B period shown on the left (same months), amount and date from the bank debits
+    paid = gst_from_bank(F)
+    g3 = sorted({r["ym"] for r in F["g3"] if not gst or r["gstin"] == gst}, reverse=True)[:6]
+    for i, ym in enumerate(g3):
+        v = paid.get(ym)
+        if not v:
+            continue
+        due = dt.date(ym[0] + (ym[1] == 12), ym[1] % 12 + 1, 20)
+        for c, x in zip("JKLMN", ("GST Challan", _mname(ym), v["amount"], v["paid"], "Timely Filed" if v["paid"] <= due else "Late Filed")):
+            ws["%s%d" % (c, 3 + i)] = x
     for c, v in zip("BCDEF", ("Particulars", "Month", "Amount (Rs.)", "Date Paid", "Remarks")):
         ws["%s10" % c] = v
     _due_rows(ws, F.get("pf", []), "B", 11, "PF", 6)
@@ -1524,6 +1752,29 @@ def draft_gst(ws, F, cfg):
         ws["J%d" % (32 + i)] = str(i + 1); ws["K%d" % (32 + i)] = din; ws["L%d" % (32 + i)] = nm
 
 
+def draft_invoice(ws, F, cfg):
+    """Sales and purchase invoices as in the drafts: in file order, the first invoice of each new party, three of each.
+    Taxable value = quantity x rate (formula), as the auditor writes it."""
+    inv_resolve(F, list(cfg["own"]) + sorted(F["names"]), cfg.get("gstin") or "")
+    for k, v in {"A": 9.6, "B": 14, "C": 12, "D": 32, "E": 28, "F": 8, "G": 12, "H": 10, "I": 15}.items():
+        ws.column_dimensions[k].width = v
+    bold = openpyxl.styles.Font(bold=True)
+    for top, kind, title, who in ((2, "sales", "Sales Invoices", "Name of Buyer"), (8, "purchase", "Purchase invoices", "Name of Supplier")):
+        ws["B%d" % top] = title; ws["B%d" % top].font = bold
+        for c, v in zip("BCDEFGHI", ("Invoice No.", "Invoice Date", who, "Item", "UOM", "Quantity", "Rate", "Taxable Value ")):
+            ws["%s%d" % (c, top + 1)] = v; ws["%s%d" % (c, top + 1)].font = bold
+        sel = [x for x in pick_invoices(F, kind) if not x["unread"]]     # proven or typed rows only
+        for i, x in enumerate(sel):
+            r = top + 2 + i
+            no = x["no"]; no = int(no) if str(no).isdigit() else no
+            for c, v in zip("BCDEFGH", (no, x["date"], x["party"], x["item"], x["uom"], x["qty"], x["rate"])):
+                ws["%s%d" % (c, r)] = v
+            ws["I%d" % r] = "=G%d*H%d" % (r, r) if x["qty"] is not None and x["rate"] is not None else None
+        if not sel:
+            ws["B%d" % (top + 2)] = ("%s invoices are scanned / handwritten - type them on the check page" % kind.title()
+                                     if pick_invoices(F, kind) else "No %s invoice found in the documents" % kind)
+
+
 def build_excel_draft(F, cfg, out):
     """Workbook in the user's own layout: summation, Insurance, GST (template = blank copy of their draft)."""
     allc = []
@@ -1531,6 +1782,7 @@ def build_excel_draft(F, cfg, out):
         for r in classify(dedupe(tx), F, cfg["related"], cfg["own"]):
             r["acc"] = acc; allc.append(r)
     wb = openpyxl.load_workbook(TEMPLATE)
+    draft_invoice(wb.create_sheet("Invoice", 0), F, cfg)
     draft_summation(wb["summation"], F, cfg, allc)
     draft_insurance(wb["Insurance"], F, cfg)
     draft_gst(wb["GST"], F, cfg)
@@ -1579,11 +1831,22 @@ def browser_summary():
         collateral=round(F["collateral"]["value"] / 1e5, 5) if F.get("collateral") else None,
         policies=[dict(no=p["no"], cls=p["cls"], frm=p["frm"], to=p["to"], stock=p["stock"], fl=p["first_loss"], build=p["build"],
                        file=p["file"], ocr=bool(p.get("ocr"))) for p in F["policies"]],
-        unread=unk, log=log))
+        invoices=_review_invoices(F), unread=unk, log=log))
+
+
+def _review_invoices(F):
+    inv_resolve(F, sorted(F["names"]), next(iter(sorted({r["gstin"] for r in F["g1"] + F["g3"]})), ""))
+    out = []
+    for kind in ("sales", "purchase"):
+        for x in pick_invoices(F, kind):
+            out.append(dict(id=x["id"], kind=kind, file=x["file"], page=x["page"], unread=x["unread"], ocr=x["ocr"], no=x["no"],
+                            date=x["date"].strftime("%d-%m-%Y") if x["date"] else "", party=x["party"], item=x["item"],
+                            uom=x["uom"], qty=x["qty"], rate=x["rate"]))
+    return out
 
 
 # ---------------- OCR of scanned pages (done in the browser by tesseract.js; parsed here by fixed rules) ----------------
-OCR_MAX_PAGES = 3
+OCR_MAX_PAGES = 10
 OCR_FIELDS = ["First Loss Percentage"]        # boxed cells read separately (digits only) - JS crops right of the label
 
 
@@ -1656,6 +1919,10 @@ def ocr_merge(path, text, fields_json):
                 if fl:
                     p["first_loss"] = int(fl.group(1)); p["ocr"] = True; p["build"] += " | first loss %s%% by OCR - check" % fl.group(1)
                     got.append("first loss %s%%" % fl.group(1))
+    if not got and re.search(r"Tax\s*Invoice|Invoice\s*No", text, re.I):
+        r = add_invoices(F, path, text.split("\f"), ocr=True)
+        if r:
+            got.append("%d invoice(s): %s" % (len(r), ", ".join(x["no"] or "page %d not readable - type it" % x["page"] for x in r)))
     if not got:
         ss = stock_statement(text) or company_stock_statement(text)
         if ss:
@@ -1678,6 +1945,29 @@ def browser_make(form_json, out):
             if p["stock"] != v: p["build"] += " | SI entered on portal: %s" % e["si"]
             p["stock"] = v
         p["first_loss"] = int(num(e["fl"])) if str(e.get("fl", "")).strip() else None
+    for x in F.get("inv", []):                  # invoice rows typed / corrected on the review page
+        e = (f.get("inv") or {}).get(x["id"])
+        if not e:
+            continue
+        shown = dict(no=x["no"], date=x["date"].strftime("%d-%m-%Y") if x["date"] else "", party=x.get("party", ""),
+                     item=x["item"], uom=x["uom"], qty="" if x["qty"] is None else str(x["qty"]),
+                     rate="" if x["rate"] is None else str(x["rate"]))
+        if all(str(e.get(k, "")).strip() == str(v).strip() for k, v in shown.items()):
+            continue                          # sent back unchanged: the rules' verdict (read / type it) stands
+        for k in ("no", "item", "uom"):
+            if str(e.get(k, "")).strip():
+                x[k] = str(e[k]).strip()
+        if str(e.get("party", "")).strip():
+            x["typed_party"] = str(e["party"]).strip()
+        if str(e.get("date", "")).strip() and d(e["date"].strip()):
+            x["date"] = d(e["date"].strip())
+        for k in ("qty", "rate"):
+            if str(e.get(k, "")).strip():
+                x[k] = num(str(e[k]))
+        x["typed"] = True
+        if x["qty"] is not None and x["rate"] is not None:
+            x["unread"] = False
+        x["hint"] = x["hint"] or e.get("kind", "")
     extra = []
     for l in lines(f.get("extra")):
         parts = [x.strip() for x in l.split(",")]
