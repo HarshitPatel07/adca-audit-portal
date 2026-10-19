@@ -57,6 +57,27 @@ def d(s):
 
 
 # ---------------- bank statements ----------------
+BANK_HEAD = [(r"A\s*X\s*I\s*S\s+B\s*A\s*N\s*K|Axis Bank", "Axis Bank"), (r"State Bank of India|\bSBI\b", "State Bank of India"),
+             (r"HDFC Bank", "HDFC Bank"), (r"ICICI Bank", "ICICI Bank"), (r"Union Bank of India", "Union Bank of India"),
+             (r"Bank of Baroda", "Bank of Baroda"), (r"Punjab National Bank", "Punjab National Bank"), (r"Canara Bank", "Canara Bank"),
+             (r"Kotak Mahindra Bank", "Kotak Mahindra Bank"), (r"IndusInd Bank", "IndusInd Bank"), (r"Yes Bank", "Yes Bank"),
+             (r"IDBI Bank", "IDBI Bank"), (r"Central Bank of India", "Central Bank of India"), (r"Bank of India", "Bank of India"),
+             (r"Indian Overseas Bank", "Indian Overseas Bank"), (r"UCO Bank", "UCO Bank"), (r"Federal Bank", "Federal Bank")]
+
+
+def bank_of(t):
+    """Bank that issued the statement, from its header only (narrations name other banks: 'ACH ICICI BANK-...')."""
+    head = t[:600] if "STATEMENT" in t[:1500] else t[:1500]
+    head = head.split("STATEMENT  FOR")[0] if "STATEMENT  FOR" in head else head
+    return next((nm for rx, nm in BANK_HEAD if re.search(rx, head, re.I)), "")
+
+
+def sheet_head(rows):
+    """Rows above a spreadsheet statement's column headings (the bank's own header; narrations below name other banks)."""
+    heads = ("narration", "particulars", "description", "transaction details", "remarks")
+    return next((i for i, r in enumerate(rows[:40]) if any(str(c or "").lower().strip() in heads for c in r)), 0)
+
+
 def bank_txt(t):
     """Finacle text statement (Axis 'STATEMENT FOR A/C'). Amount = balance difference."""
     acc = re.search(r"A/C\s*:\s*(\d+)", t)
@@ -709,7 +730,7 @@ def tally_group_total(rows, head):
 
 # ---------------- scan everything ----------------
 def scan(paths, log):
-    F = dict(bank={}, g1=[], g3=[], ss=[], book=[], debtors=set(), creditors=set(), directors=[], policies=[], names=set(),
+    F = dict(bank={}, bank_name={}, g1=[], g3=[], ss=[], book=[], debtors=set(), creditors=set(), directors=[], policies=[], names=set(),
              pf=[], esic=[], elec=[], dins=[], deb_tot=[], cred_tot=[])
     for p in paths:
         fn = os.path.basename(p); ext = fn.lower().rsplit(".", 1)[-1] if "." in fn else ""
@@ -722,7 +743,7 @@ def scan(paths, log):
                         F[key].append(r); log.append(("GSTR-" + r["kind"], fn, "%d-%02d taxable %s" % (r["ym"] + (r["taxable"],)))); break
                 else:
                     if "Account Statement Report" in t or "Statement of Axis Bank" in t:
-                        a, tx = bank_pdf(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); log.append(("Bank PDF", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
+                        a, tx = bank_pdf(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); F["bank_name"][a] = F["bank_name"].get(a) or bank_of(t); log.append(("Bank PDF", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
                     elif stock_statement(t):
                         r = stock_statement(t); F["ss"].append(r); log.append(("Stock statement", fn, "%s stock %s" % (r["date"], r["stock"])))
                     elif company_stock_statement(t):
@@ -765,7 +786,7 @@ def scan(paths, log):
             elif ext == "txt":
                 t = open(p, encoding="utf-8", errors="replace").read()
                 if "STATEMENT" in t and "BALANCE" in t:
-                    a, tx = bank_txt(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); log.append(("Bank TXT", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
+                    a, tx = bank_txt(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); F["bank_name"][a] = F["bank_name"].get(a) or bank_of(t); log.append(("Bank TXT", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
             elif ext in ("xlsx", "xlsm", "csv"):
                 if ext == "csv":
                     rows = [l.rstrip("\n").split(",") for l in open(p, encoding="utf-8", errors="replace")]
@@ -798,7 +819,9 @@ def scan(paths, log):
                     acc, tx = bank_table(rows)
                     if tx:
                         [x.update(src=fn) for x in tx]
-                        F["bank"].setdefault(acc or fn, []).extend(tx); log.append(("Bank sheet", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
+                        F["bank"].setdefault(acc or fn, []).extend(tx)
+                        F["bank_name"][acc or fn] = F["bank_name"].get(acc or fn) or bank_of(" ".join(str(c) for r in rows[:sheet_head(rows)] for c in r if c))
+                        log.append(("Bank sheet", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
                     else:
                         log.append(("skipped", fn, "not recognised"))
             else:
@@ -1288,9 +1311,10 @@ def draft_summation(ws, F, cfg, allc):
         months.append(ym); ym = _ym_add(ym, 1)
     per = "%s To %s" % (_mlab(start), _mlab(base))
     banks = cfg.get("banks") or []
-    bank1 = banks[0][0] if banks else "Bank"
     accs = sorted(F["bank"].items(), key=lambda kv: -len(kv[1]))
     cc = next((a for a, tx in accs if _is_cc(dedupe(tx))), accs[0][0] if accs else "")
+    # check page left the bank blank -> the bank named in the CC statement's header (Gold Star: 'A X I S  B A N K')
+    bank1 = banks[0][0] if banks and banks[0][0] else ((F.get("bank_name") or {}).get(cc) or "Bank")
     ca = next((a for a, tx in accs if a != cc), None)
     inp = lambda t: start <= (t["date"].year, t["date"].month) <= base
 
