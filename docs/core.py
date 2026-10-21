@@ -860,19 +860,39 @@ def invoice_page(t, own_names=(), kind_hint=""):
                 best = (q, _uom(u), r); break
         if best:
             break
+    if not best:
+        # OCR slipped ONE digit of the rate (Gold Star 432: '162.51' printed 152.51): amount / qty is the rate when it
+        # differs from a rate read on the row in exactly one digit, and qty x that rate equals the printed amount
+        for q, u in qtys:
+            for r in _inv_nums(seg):
+                for a in amounts:
+                    if q <= 0 or r <= 0 or a in (q, r):
+                        continue
+                    rr = round(a / q, 2)
+                    s1, s2 = "%.2f" % r, "%.2f" % rr
+                    if abs(rr * q - a) <= 1.0 and len(s1) == len(s2) and sum(c1 != c2 for c1, c2 in zip(s1, s2)) == 1:
+                        best = (q, _uom(u), rr); break
+                if best: break
+            if best: break
     item = ""
     if seg:
         item = re.split(r"\s*[|]\s*|\s+\d{4,8}\b|\s+HSN\b|\s*\(", seg.split("\n")[0].strip())[0].strip(" :-")
     # invoice number + date: Tally prints 'Invoice No. | e-Way Bill No. | Dated' with the values below
     no = dte = None
-    m = re.search(r"Invoice\W{0,2}No\.?.{0,40}?\n(?:.*?\b)?([A-Z]{0,4}/?[0-9][A-Z0-9/\-]{0,18})[\s|]+(?:\d{12}[\s|]+)?" + INV_DATE, f, re.I | re.S)
+    INV_NO = r"In[vw][o0]?[il1]?[cec]e\W{0,3}N[o0]"          # OCR: 'Invoice No', "Involce'No:", 'lnvoice N0'
+    m = re.search(INV_NO + r"\.?.{0,40}?\n(?:.*?\b)?([A-Z]{0,4}/?[0-9][A-Z0-9/\-]{0,18})[\s|]+(?:\d{12}[\s|]+)?" + INV_DATE, f, re.I | re.S)
     if m and len(m.group(0)) < 260:
         no, dte = m.group(1), m.group(2)
     if not no:
-        m = re.search(r"Invoice\s*No\.?\s*\n\s*(?:e-?Way\s*Bill\s*No\.?\s*\n\s*)?([A-Z0-9][A-Z0-9/\-]{0,20})\s*\n", f, re.I)
+        m = re.search(INV_NO + r"\.?\s*\n\s*(?:e-?Way\s*Bill\s*No\.?\s*\n\s*)?([A-Z0-9][A-Z0-9/\-]{0,20})\s*\n", f, re.I)
         no = m.group(1) if m else None
         md = re.search(r"Dated\s*\n\s*" + INV_DATE, f, re.I) or re.search(r"Ack\s*Date\s*:?\s*" + INV_DATE, f, re.I)
         dte = md.group(1) if md else None
+    if dte and not d(dte):
+        # OCR misread the date cell ('65-Oct-26'): the reference '<no> dt. <date>' or the e-invoice Ack Date are the same day
+        md = (re.search(re.escape(no) + r"\s*dt\.?\s*" + INV_DATE, f, re.I) if no else None) or \
+            re.search(r"Ack\s*Date\s*:?\s*" + INV_DATE, f, re.I)
+        dte = md.group(1) if md and d(md.group(1)) else dte
     # names: the company lines at the top (seller first) and the 'Buyer (Bill to)' name; sales / purchase is decided at
     # build time (folder name, GSTIN, own name), when the borrower's names and GSTIN are known
     lines = [x.strip(" |") for x in f.split("\n") if x.strip(" |")]
@@ -889,6 +909,8 @@ def invoice_page(t, own_names=(), kind_hint=""):
 
 def _clean_party(s):
     s = re.sub(r"^\s*(?:Name|M/s\.?)\s*:?\s*", "", re.sub(r"\s+", " ", s or ""), flags=re.I).strip(" |-")
+    # OCR joins the header cell to the name: "Magnum Polysure Pvt Ltd Involce'No:, eWay Bil No.| Dated"
+    s = re.split(r"\s+(?:In[vw]\w{0,3}[cec]e\W*N[o0]|Invoice|e-?\s*Way|Dated\b|Ack\b|IRN\b)", s, flags=re.I)[0].strip(" |-,:'")
     return s[:-1] if s.endswith(".") and s.count(".") == 1 else s     # 'Sevenstar Polytex Pvt Ltd.' -> no stray dot
 
 
@@ -949,11 +971,16 @@ def pick_invoices(F, kind, n=3):
     An unread page (handwritten / scanned) stays in its place so the auditor can type it on the review page."""
     out, seen = [], set()
     for x in sorted([x for x in F.get("inv", []) if x["kind"] == kind], key=lambda x: (x["file"].lower(), x["page"])):
-        key = nospace((x.get("party") or "").upper())[:14]
-        if x["unread"] or not key:
-            out.append(x)
-        elif key not in seen:
-            seen.add(key); out.append(x)
+        key = nospace((x.get("party") or "").upper())[:10]
+        if key and _looks_garbled(x.get("party")):
+            key = ""
+        # an unread page keeps its place AND its party: a later invoice of the same party is not taken instead
+        # (Gold Star: OCR missed Sevenstar 432 on page 1 -> Sevenstar 379 on page 2 was wrongly used)
+        if key in seen and key:
+            continue
+        if key:
+            seen.add(key)
+        out.append(x)
         if len(out) == n:
             break
     return out
@@ -1886,9 +1913,11 @@ def draft_invoice(ws, F, cfg):
         ws["B%d" % top] = title; ws["B%d" % top].font = bold
         for c, v in zip("BCDEFGHI", ("Invoice No.", "Invoice Date", who, "Item", "UOM", "Quantity", "Rate", "Taxable Value ")):
             ws["%s%d" % (c, top + 1)] = v; ws["%s%d" % (c, top + 1)].font = bold
-        sel = [x for x in pick_invoices(F, kind) if not x["unread"]]     # proven or typed rows only
+        sel = pick_invoices(F, kind)
         for i, x in enumerate(sel):
             r = top + 2 + i
+            if x["unread"]:                 # not proven and not typed on the check page: row kept blank in its place
+                continue
             no = x["no"]; no = int(no) if str(no).isdigit() else no
             for c, v in zip("BCDEFGH", (no, x["date"], x["party"], x["item"], x["uom"], x["qty"], x["rate"])):
                 ws["%s%d" % (c, r)] = v
