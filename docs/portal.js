@@ -114,24 +114,54 @@ function b64(bytes) {
   return btoa(s);
 }
 
-async function askGemini(key, model, prompt, data) {
-  const body = {contents: [{parts: [{inline_data: {mime_type: "application/pdf", data}}, {text: prompt}]}],
-                generationConfig: {responseMimeType: "application/json", temperature: 0}};
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-      {method: "POST", headers: {"Content-Type": "application/json", "x-goog-api-key": key}, body: JSON.stringify(body)});
-    if (r.status === 429 || r.status >= 500) { await new Promise(res => setTimeout(res, 4000 * (attempt + 1))); continue; }
-    const j = await r.json();
-    if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
+// several keys: a key that is rate-limited or rejected is set aside and the next one is used
+const AI = {keys: [], cur: 0, dead: new Set(), restUntil: {}};
+
+function nextKey() {
+  const n = AI.keys.length;
+  for (let k = 0; k < n; k++) {
+    const i = (AI.cur + k) % n;
+    if (!AI.dead.has(i) && !(AI.restUntil[i] > Date.now())) { AI.cur = i; return i; }
+  }
+  return -1;
+}
+
+async function askGemini(model, prompt, data) {
+  const body = JSON.stringify({contents: [{parts: [{inline_data: {mime_type: "application/pdf", data}}, {text: prompt}]}],
+                               generationConfig: {responseMimeType: "application/json", temperature: 0}});
+  let lastErr = "no working key";
+  for (let attempt = 0; attempt < 4 * AI.keys.length + 4; attempt++) {
+    const i = nextKey();
+    if (i < 0) {                                 // every key resting: wait for the first one to come back
+      const live = Object.values(AI.restUntil).filter(t => t > Date.now());
+      if (!live.length || AI.dead.size === AI.keys.length) break;
+      await new Promise(res => setTimeout(res, Math.min(...live) - Date.now() + 200)); continue;
+    }
+    let r, j = {};
+    try {
+      r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {method: "POST", headers: {"Content-Type": "application/json", "x-goog-api-key": AI.keys[i]}, body});
+      j = await r.json().catch(() => ({}));
+    } catch (e) { lastErr = e.message; AI.restUntil[i] = Date.now() + 5000; AI.cur = i + 1; continue; }
+    const msg = (j.error && j.error.message) || ("HTTP " + r.status);
+    if (r.status === 429 || r.status >= 500) {   // limit / busy: rest this key, use the next
+      lastErr = `key ${i + 1}: ${msg}`; AI.restUntil[i] = Date.now() + (r.status === 429 ? 60000 : 8000); AI.cur = i + 1; continue;
+    }
+    if (r.status === 400 && /api key/i.test(msg) || r.status === 401 || r.status === 403) {
+      lastErr = `key ${i + 1}: ${msg}`; AI.dead.add(i); AI.cur = i + 1; continue;
+    }
+    if (!r.ok) throw new Error(msg);
     return ((j.candidates || [])[0]?.content?.parts || []).map(p => p.text || "").join("");
   }
-  throw new Error("Gemini busy (rate limit) - try again in a minute");
+  throw new Error(lastErr);
 }
 
 async function runAI(s) {
-  const key = $("aiKey").value.trim(), model = $("aiModel").value;
-  try { localStorage.setItem("aiKey", key); localStorage.setItem("aiModel", model); } catch (e) {}
-  if (!key) return s;
+  const model = $("aiModel").value;
+  const keys = [...new Set($("aiKey").value.split(/[\s,;]+/).map(x => x.trim()).filter(x => x.length > 20))];
+  try { localStorage.setItem("aiKey", keys.join("\n")); localStorage.setItem("aiModel", model); } catch (e) {}
+  if (!keys.length) return s;
+  Object.assign(AI, {keys, cur: 0, dead: new Set(), restUntil: {}});
   const core = py.globals.get("core");
   const cand = JSON.parse(core.ai_candidates());
   let done = 0, failed = [];
@@ -141,13 +171,15 @@ async function runAI(s) {
       const f = queue.shift();
       status(`AI reading ${++done} of ${cand.files.length}: ${f.file} ...`);
       try {
-        const text = await askGemini(key, model, cand.prompt, b64(py.FS.readFile(f.path)));
+        const text = await askGemini(model, cand.prompt, b64(py.FS.readFile(f.path)));
         s = JSON.parse(core.ai_merge(f.path, text));
       } catch (e) { failed.push(f.file + " (" + e.message + ")"); }
     }
   }
   await Promise.all([worker(), worker(), worker()]);
-  if (failed.length) status("AI could not read: " + failed.join("; "), true);
+  const bad = [...AI.dead].map(i => "key " + (i + 1));
+  if (failed.length || bad.length) status((bad.length ? "Rejected keys (check them): " + bad.join(", ") + ". " : "") +
+                                          (failed.length ? "AI could not read: " + failed.join("; ") : ""), true);
   return s;
 }
 

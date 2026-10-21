@@ -17,8 +17,8 @@
     <label>Whole folder</label><input type="file" id="folder" webkitdirectory multiple>
     <label>- or individual files</label><input type="file" id="files" multiple>
     <p class="small">Used: PDF, TXT, XLSX, XLS, CSV (photos skipped). Bank statements, GSTR-1/3B, insurance policies, stock statements, Tally debtors/creditors/stock, MCA master.</p>
-    <label>Gemini API key (optional - kept only in this browser; blank = rules and OCR only, nothing leaves this computer)</label>
-    <div class="two"><input type="password" id="aiKey" placeholder="paste key from aistudio.google.com" autocomplete="off">
+    <label>Gemini API keys (optional, one per line - when one key hits its limit or fails, the next is used; kept only in this browser; blank = rules and OCR only, nothing leaves this computer)</label>
+    <div class="two"><textarea id="aiKey" placeholder="paste keys from aistudio.google.com, one per line" autocomplete="off" spellcheck="false" style="-webkit-text-security:disc;flex:1 1 220px;min-height:60px"></textarea>
       <select id="aiModel"><option value="gemini-flash-latest">Gemini Flash (fast)</option>
         <option value="gemini-3.1-pro-preview">Gemini Pro (slower, most careful)</option></select></div>
     <button id="readBtn" disabled>Read documents</button>
