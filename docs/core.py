@@ -25,10 +25,15 @@ def num(s):
     return float(s) if s not in ("", "-") else 0.0
 
 
+PDF_FIX = str.maketrans({"\xa0": " ", " ": " ", " ": " ", "\xad": "-", ";": ";"})
+
+
 def pdf_text(p):
+    """Text layer of a PDF. Non-breaking spaces / soft hyphens are made plain (ICICI Lombard prints every space as
+    U+00A0, so 'Policy Number' would never match)."""
     try:
         with pymupdf.open(p) as doc:
-            return "".join(pg.get_text() for pg in doc)
+            return "".join(pg.get_text() for pg in doc).translate(PDF_FIX)
     except Exception:
         return ""
 
@@ -339,9 +344,13 @@ BANK_NAMES = (r"\b(?:AXIS BANK|STATE BANK OF INDIA|UNION BANK OF INDIA|BANK OF I
 
 def _policy_details(f, p):
     """Nature of the policy, financier (bank) and insured address - shown in the Insurance sheet blocks."""
+    # product name as the schedule prints it ('ICICI LOMBARD MSME SURAKSHA KAVACH', 'FLEXI COMMERCIAL PROPERTY GUARD')
     m = re.search(r"Undertaking\)\|([^|]{6,90})", f) or \
+        re.search(r"(FLEXI COMMERCIAL PROPERTY GUARD)", f) or \
+        re.search(r"\|((?:ICICI LOMBARD )?MSME SURAKSHA KAVACH|Business Guard Sookshma[^|]{0,40}"
+                  r"|[A-Z][A-Za-z ]{0,30}Sookshma Udyam[^|]{0,30}|[A-Z][A-Za-z ]{0,30}Laghu Udyam[^|]{0,30})\s*(?:\(|\|)", f) or \
         re.search(r"(INDUSTRIAL ALL RISK[^|]{0,40}|BURGLARY[^|]{0,40}INSURANCE[^|]{0,20}|STANDARD FIRE[^|]{0,40}|BHARAT [^|]{0,40})", f, re.I)
-    p["nature"] = m.group(1).strip() if m else p["cls"]
+    p["nature"] = re.sub(r"\s*(?:\(UIN\)|:\s*IRDA|UIN\s*:).*$", "", m.group(1)).strip() if m else p["cls"]   # drop '(UIN) : IRDAN...'
     # financier: known bank names after the financier / hypothecation label (several banks are joined)
     banks = []
     for mk in re.finditer(r"Financier|Financial Institute Name|Name of the Pledgee|Hypothecation|Bank Details|HP-|Hypo\b|Agreed Bank|Bank Clause|Interest of", f, re.I):
@@ -440,7 +449,7 @@ AMT = r"[`₹]?\s*(?:Rs\.?\s*)?([\d,]{5,}(?:\.\d+)?)"
 def _gdate(s):
     """'28/01/2026', '05-JUN-2026', '07-JUN-26', 'Feb 02, 2025' -> 'dd/mm/yyyy'"""
     s = s.strip()
-    for f in ("%d/%m/%Y", "%d-%m-%Y", "%d-%b-%Y", "%d-%b-%y", "%b %d, %Y", "%d %b %Y", "%d.%m.%Y"):
+    for f in ("%d/%m/%Y", "%d-%m-%Y", "%d-%b-%Y", "%d-%b-%y", "%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d.%m.%Y"):
         try:
             return dt.datetime.strptime(s.title() if "%b" in f else s, f).strftime("%d/%m/%Y")
         except ValueError:
@@ -448,15 +457,18 @@ def _gdate(s):
     return None
 
 
-DATE = r"(\d{2}[/.-](?:\d{2}|[A-Za-z]{3})[/.-]\d{2,4}|[A-Z][a-z]{2} \d{1,2}, \d{4})"
+DATE = r"(\d{2}[/.-](?:\d{2}|[A-Za-z]{3})[/.-]\d{2,4}|[A-Z][a-z]{2,8} \d{1,2}, \d{4})"
 
 
 def _period(f):
     i = f.find("Period of Insurance")
     seg = f[i:i + 400] if i >= 0 else f
-    m = re.search(r"From\W{0,6}(?:\d{2}:\d{2}(?::\d{2})?\s*(?:Hours of\s*)?)?" + DATE + r".{0,80}?To\W{0,6}(?:Midnight of\s*)?" + DATE, seg, re.S)
+    # 'From : 00:00 Hours of 21/04/2025 To : 23:59 Hours of 20/04/2026' (ICICI) / 'To Midnight of ...'
+    TM = r"(?:\d{2}:\d{2}(?::\d{2})?\s*(?:Hours?\s*of\s*)?|Midnight\s*of\s*)?"
+    rx = r"From\W{0,6}" + TM + DATE + r".{0,80}?To\W{0,6}" + TM + DATE
+    m = re.search(rx, seg, re.S)
     if not m and i >= 0:
-        m = re.search(r"From\W{0,6}(?:\d{2}:\d{2}(?::\d{2})?\s*(?:Hours of\s*)?)?" + DATE + r".{0,80}?To\W{0,6}(?:Midnight of\s*)?" + DATE, f, re.S)
+        m = re.search(rx, f, re.S)
     if not m:
         m = re.search(DATE + r"\s*To\s*" + DATE, f)
     if not m:
@@ -516,11 +528,24 @@ def policy_generic(f, fname):
             sis = amts[0::2]
             if sis:
                 found.append(("Item SI (burglary schedule)", sum(sis)))
-    # 2) sum-insured table: 'Stocks' label, optional description lines, amount
+    # 1b) first-loss table (ICICI burglary): 'S No.|Sum Insured Component|First Loss Sum Insured|Balance|Total Sum Insured'
+    #     each row 'Stocks|Rs. 60,000,000.0|0|Rs. 90,000,000.0|0|Rs. 150,000,000.|00' -> the TOTAL column is the SI
+    i = f.find("Sum Insured Component")
+    if not found and i >= 0 and re.search(r"First Loss Sum", f[i:i + 200]):
+        seg = re.sub(r"(\.\d?)\|(\d{1,2})(?=\|)", r"\1\2", f[i:i + 2000])      # '150,000,000.|00|' -> '150,000,000.00|'
+        rows = re.findall(r"(?<=\|)\d+\.\|([A-Za-z][^|]{1,60})\|((?:Rs\.?\s*[\d,]+(?:\.\d+)?\|?){2,3})", seg)
+        for lab, amts in rows:
+            vals = [num(x) for x in re.findall(r"Rs\.?\s*([\d,]+(?:\.\d+)?)", amts)]
+            p.setdefault("items", []).append((lab.strip(), vals[-1] / 1e5))
+            if re.match(r"Stocks?\b", lab.strip(), re.I):
+                found.append(("%s (total SI; first loss %s)" % (lab.strip(), "{:,.2f}".format(vals[0])), vals[-1]))
+                if len(vals) >= 2 and vals[-1]:
+                    p["first_loss"] = int(round(100 * vals[0] / vals[-1]))
+    # 2) sum-insured table: 'Stocks' / 'Finished Stocks' label, optional description lines, amount
     if not found:
         # description lines are text only: a figure right after 'Stocks' is ITS sum insured, even 0.00 (Bajaj
         # 'Stocks|0.00|Stock in Process|0.00|...|Plant and Machinery|1,50,00,000.00' is NOT 150 lakh of stock)
-        for m in re.finditer(r"\|(Stocks?(?:\s*[-:][^|]{0,100})?)\|((?:(?!\s*[`₹]?\s*(?:Rs\.?\s*)?[\d,]+(?:\.\d+)?\s*\|)[^|]{0,130}\|){0,6}?)"
+        for m in re.finditer(r"\|((?:Finished |Raw Material |Total )?Stocks?(?:\s*[-:][^|]{0,100})?)\|((?:(?!\s*[`₹]?\s*(?:Rs\.?\s*)?[\d,]+(?:\.\d+)?\s*\|)[^|]{0,130}\|){0,6}?)"
                              r"[`₹]?\s*(?:Rs\.?\s*)?([\d,]{5,}(?:\.\d+)?|[\d,]+\.\d\d)\|", f, re.I):
             lab, desc, v = m.group(1), m.group(2), num(m.group(3))
             # skip a 'stock in process' line and the header row of a column table (row number / 'Total sum insured' before the amount)
@@ -541,13 +566,17 @@ def policy_generic(f, fname):
     else:
         p["build"] = "Stock SI not found in this policy text - type it on the review page"
     ex = []
-    for lab in ("(?:Super Structure )?Building", "Plant (?:&|and) Machinery", "Furniture[^|]{0,40}", "Contents", "Electrical Installations?"):
+    for lab in ("(?:Super Structure )?Building", r"Plant[ ,]*(?:&|and)?\s*Machinery", "Furniture[^|]{0,40}", "Contents", "Electrical Installations?"):
         m = re.search(r"\|(" + lab + r")[^|]{0,70}\|" + AMT + r"\|", f, re.I)
         if m and num(m.group(2)) > 0:
             ex.append("%s %.2f" % (m.group(1)[:30], num(m.group(2)) / 1e5))
             p.setdefault("items", []).append((m.group(1).strip()[:30], num(m.group(2)) / 1e5))
     p["excluded"] = "; ".join(ex) + (" (lakh)" if ex else "")
-    p["items"] = p.get("items", []) + ([("Stock", p["stock"])] if p["stock"] is not None else [])
+    has_stock = any(re.match(r"Stocks?\b", k, re.I) for k, _ in p.get("items", []))
+    slab = "Stock"
+    if len(found) == 1 and re.match(r"(?:Finished |Raw Material )Stocks?$", found[0][0].strip(), re.I):
+        slab = found[0][0].strip()                    # the policy's own words ('Finished Stocks'), as the drafts copy them
+    p["items"] = p.get("items", []) + ([(slab, p["stock"])] if p["stock"] is not None and not has_stock else [])
     return p
 
 
@@ -569,6 +598,8 @@ def tally_pdf_kind(t):
     if re.search(r"Group Monthly Summary|Monthly Summary", ends) and re.search(r"\|Sales(?: Accounts| Local| A/c)?\|", f) \
             and not re.search(r"Purchase", ends, re.I):
         return "Sales"
+    if re.search(r"Stock\s*(?:Group|Item|Category)?\s*Monthly\s*Summary", ends, re.I):
+        return "StockMonthly"
     if re.search(r"Stock (?:Group )?Summary", ends):
         return "Stock"
     if re.search(r"\|(?:Sundry )?Debtors\b", ends, re.I) and re.search(r"Group Summary|Closing Balance|Closing", ends, re.I):
@@ -638,6 +669,32 @@ def tally_pdf_stock(t):
     """Tally Stock (Group) Summary PDF: closing value of the Grand Total row, dated by the period end."""
     r = tally_pdf_stocks(t)
     return r[0] if r else None
+
+
+def tally_pdf_stock_monthly(t):
+    """Tally 'Stock Group MonthlySummary': closing value of every month up to the report end (Bhawani: April
+    13,19,52,881.54 ...). Months after the end date repeat the last closing and are skipped; the end month is dated
+    by the report end ('1-Apr-25 to 24-Dec-25' -> 24-12-2025)."""
+    f = t.replace("\n", "|")
+    per = re.search(r"1-([A-Za-z]{3})-(\d{2,4}) to (\d{1,2}-[A-Za-z]{3}-\d{2,4})", f)
+    if not per or not d(per.group(3)):
+        return []
+    # one stock group only ('Page 1 | RAW MATERIAL | P a r t i c u l a r s') is a part of the stock, not the total
+    grp = re.search(r"Page\s*\d+\|([^|]{2,60})\|P\s*a\s*r\s*t\s*i\s*c\s*u\s*l\s*a\s*r\s*s", f)
+    if grp:
+        return []
+    y = int(per.group(2)); y = y + 2000 if y < 100 else y; m = MON[per.group(1).lower()]; end = d(per.group(3))
+    names = [dt.date(2000, i, 1).strftime("%B") for i in range(1, 13)]
+    out = []
+    for mm in re.finditer(r"(?<=\|)(" + "|".join(names) + r")\|(" + PDF_AMT + r")(?=\|)", f):
+        mi = names.index(mm.group(1)) + 1
+        while mi != m:
+            m = m % 12 + 1; y += (m == 1)
+        day = min(month_end(y, m), end)
+        if dt.date(y, m, 1) > end:
+            break
+        out.append(dict(date=day, stock=round(num(mm.group(2)) / 1e5, 5)))
+    return out
 
 
 def tally_pdf_stocks(t):
@@ -769,6 +826,29 @@ def gst_challan(t):
     return dict(cpin=cp.group(1), gstin=g.group(1) if g else "", paid=d(dd.group(1)), amount=num(am.group(1)))
 
 
+def elec_bill_issue(t):
+    """Electricity bill with a 'Billing Month' yyyymm table (JVVNL / Rajasthan discoms): billing month, bill issue date,
+    due date and the Net Payable Amount - written as the drafts do (Bhawani Oct'25: 05-10-2025, 10,00,303)."""
+    f = t.replace("\n", "|")
+    i = f.find("Billing Month")
+    if i < 0 or not re.search(r"VIDYUT|ELECTRICITY|POWER|DISCOM|Energy", f[:4000], re.I):
+        return None
+    seg = f[i:i + 700]
+    bm = re.search(r"\|(20\d{2})(0[1-9]|1[0-2])\|", seg)
+    if not bm:
+        return None
+    ds = [d(x) for x in re.findall(r"\d{2}-(?:\d{2}|[A-Za-z]{3})-\d{4}", seg[bm.end():])]
+    ds = [x for x in ds if x]
+    hd = seg[:bm.start()]                         # order of the date columns as the header prints them
+    cols = [(k, hd.find(w)) for k, w in (("read", "Reading Date"), ("issue", "Bill Issue"), ("due", "Due Date")) if hd.find(w) >= 0]
+    order = [k for k, _ in sorted(cols, key=lambda kv: kv[1])]
+    dd = dict(zip(order, ds))
+    net = re.search(r"Net Payable Amount\|(?:[\d.,-]+\|){0,8}?(\d[\d,]*(?:\.\d+)?)\|[A-Z][a-z]+(?: [A-Za-z]+)* (?:Crore|Lakh|Thousand|Hundred|Rupees)", f)
+    if not (dd.get("issue") and net):
+        return None
+    return dict(ym=(int(bm.group(1)), int(bm.group(2))), bill_date=dd["issue"], due=dd.get("due"), amount=num(net.group(1)))
+
+
 def mca_dins(rows):
     """[(DIN/PAN, name)] of directors from the MCA master data sheet."""
     out = []
@@ -816,7 +896,7 @@ CO_WORDS = r"\b(?:Pvt|Private|Ltd|Limited|LLP|Industries|Enterprises|Traders|Tra
 def pdf_pages(p):
     try:
         with pymupdf.open(p) as doc:
-            return [pg.get_text() for pg in doc]
+            return [pg.get_text().translate(PDF_FIX) for pg in doc]
     except Exception:
         return []
 
@@ -1016,6 +1096,10 @@ def scan(paths, log):
                             log.append(("Creditor ledger" if cred else "Debtor ledger", fn, "%d names (PDF)%s" % (len(n), (
                                 "; closing %s" % ", ".join("%s %.2f lakh" % (x["date"].strftime("%d-%m-%Y"), (x["cr"] if cred else x["dr"] - x["cr"]) / 1e5)
                                                            for x in tt[-3:])) if tt else "")))
+                        elif k == "StockMonthly":
+                            rs = tally_pdf_stock_monthly(t)
+                            F["book"].extend(rs)
+                            log.append(("Book stock" if rs else "skipped", fn, "; ".join("%s %s lakh" % (r["date"], r["stock"]) for r in rs) + " (monthly summary PDF)" if rs else "monthly stock summary without figures"))
                         elif k == "Stock":
                             rs = tally_pdf_stocks(t)
                             if rs:
@@ -1042,6 +1126,11 @@ def scan(paths, log):
                             log.append(("GST challan", fn, "CPIN %s already read from another file - counted once" % r["cpin"]))
                         else:
                             F["challan"].append(r); log.append(("GST challan", fn, "Rs %s deposited %s" % (r["amount"], r["paid"])))
+                    elif elec_bill_issue(t):
+                        r = elec_bill_issue(t)
+                        if not any(x["ym"] == r["ym"] for x in F["elec_ai"]):
+                            F["elec_ai"].append(r)
+                        log.append(("Electricity bill", fn, "%d-%02d issued %s net payable %s" % (r["ym"] + (r["bill_date"], r["amount"]))))
                     elif electricity_bill(t):
                         r = electricity_bill(t); F["elec"].append(r)
                         log.append(("Electricity bill", fn, "%d-%02d net payable %s; previous month paid %s on %s" % (r["ym"] + (r["net"], r["prev_amount"], r["prev_paid"]))))
@@ -1720,19 +1809,41 @@ def draft_insurance(ws, F, cfg):
     fitems = lambda p: [(k, p["stock"] if k == "Stock" else v) for k, v in (p.get("items") or [("Stock", p["stock"])])][:5]
     _pol_block(ws, "B", 1, fire[0] if fire else None, fitems(fire[0]) if fire else [])
     _pol_block(ws, "H", 1, fire[1] if len(fire) > 1 else None, fitems(fire[1]) if len(fire) > 1 else [])
-    _pol_block(ws, "B", 12, burg[0] if burg else None, [("Stock", burg[0]["stock"])] if burg else [])
-    _pol_block(ws, "H", 12, burg[1] if len(burg) > 1 else None, [("Stock", burg[1]["stock"])] if len(burg) > 1 else [])
-    # stock vs insured: the last three stock-statement dates up to the summation end month + the visit date
+    bitems = lambda p: [(k, v) for k, v in p["items"]][:5] if len(p.get("items") or []) > 1 else [("Stock", p["stock"])]
+    _pol_block(ws, "B", 12, burg[0] if burg else None, bitems(burg[0]) if burg else [])
+    _pol_block(ws, "H", 12, burg[1] if len(burg) > 1 else None, bitems(burg[1]) if len(burg) > 1 else [])
+    # stock vs insured, as the drafts list it (Gold Star, Clan, Denis, Baid): every stock date from the month before the
+    # summation period to its end - book stock where the books give it, else the stock statements - not before the first
+    # stock policy starts (Baid: policy from 14-11-2025 -> Nov'25 on) - then the visit date
     base = month_end(*cfg["sum_to"])
-    books = {b["date"]: b["stock"] for b in F["book"] if b.get("date")}
+    books = {}
+    for b in F["book"]:
+        if b.get("date"):
+            books[b["date"]] = max(books.get(b["date"], 0), b["stock"])     # a group report never beats the total
     ss = {s["date"]: s for s in F["ss"] if s.get("date")}
-    dates = sorted(x for x in set(ss) | set(books) if x <= base)[-3:]     # stock statements or books (Denis: books only)
+    lo = _ym_add(cfg["sum_from"], -1)
+    starts = [pdate(p["frm"]) for p in pols.values() if p["cls"] in ("Fire", "Burglary") and p.get("stock")]
+    if starts:
+        lo = max(lo, (min(starts).year, min(starts).month))
+    inwin = lambda xs: sorted(x for x in xs if lo <= (x.year, x.month) and x <= base)
+    dates = inwin(books) or inwin(ss)
     visit = cfg.get("visit") or max([x for x in books if x > base] or [None], key=lambda x: x or dt.date.min)
     for c, v in (("B20", "Month"), ("C20", "Total Stock"), ("D20", "Insured Amt (Fire)"), ("E20", "Insured Amt (Burglary)"), ("F20", "Remarks")):
         ws[c] = v
     use = list(pols.values())
     rows = [(x, _mlab((x.year, x.month))) for x in dates] + ([(visit, "Visit date %s" % visit.strftime("%d-%m-%Y"))] if visit else [])
-    for i, (day, lab) in enumerate(rows[:4]):
+    extra = max(0, len(rows) - 4)                     # the template has 4 rows (21-24): insert more, styled like row 24
+    if extra:
+        ws.insert_rows(25, extra)
+        from copy import copy
+        for k in range(extra):
+            for col in range(1, 8):
+                src, dst = ws.cell(24, col), ws.cell(25 + k, col)
+                if src.has_style:
+                    dst._style = copy(src._style)
+                dst.number_format = src.number_format
+    o = extra
+    for i, (day, lab) in enumerate(rows):
         r = 21 + i
         stock = books.get(day)
         if stock is None and day in ss:
@@ -1742,7 +1853,7 @@ def draft_insurance(ws, F, cfg):
         fp, _ = cover(use, "Fire", day); bp, _ = cover(use, "Burglary", day)
         fsi = fp["stock"] if fp and fp["stock"] is not None else ("SI not stated" if fp else "Policy not provided")
         bsi = bp["stock"] if bp and bp["stock"] is not None else ("SI not stated" if bp else "Policy not provided")
-        ws["B%d" % r] = lab; ws["C%d" % r] = round(stock, 2) if stock is not None else None
+        ws["B%d" % r] = lab; ws["C%d" % r] = round(stock, 5) if stock is not None else None
         ws["D%d" % r] = fsi; ws["E%d" % r] = bsi
         if stock is None or not isinstance(fsi, (int, float)):
             rem = "Unable to comment"
@@ -1752,25 +1863,26 @@ def draft_insurance(ws, F, cfg):
             rem = "Adequately Insured"
         ws["F%d" % r] = rem
     # fixed assets and collateral as in the draft: insured value from the current fire policy; asset values typed on the portal
-    ws["B27"] = "Fixed asset schedule"
-    for c, v in (("B28", "Particulars"), ("C28", "Assets value (Rs. Lakhs)"), ("D28", "Insured Value (Rs. In Lakhs)"), ("E28", "Remarks")):
-        ws[c] = v
+    ws["B%d" % (27 + o)] = "Fixed asset schedule"
+    for c, v in (("B", "Particulars"), ("C", "Assets value (Rs. Lakhs)"), ("D", "Insured Value (Rs. In Lakhs)"), ("E", "Remarks")):
+        ws["%s%d" % (c, 28 + o)] = v
     it = dict((k.lower(), v) for k, v in (fire[0].get("items") or [])) if fire else {}
     pm = next((v for k, v in it.items() if "plant" in k), None)
     bld = next((v for k, v in it.items() if "building" in k), None)
-    ws["B29"] = "Plant & Machinery"; ws["C29"] = cfg.get("pm_value"); ws["D29"] = round(pm, 2) if pm is not None else None
+    ws["B%d" % (29 + o)] = "Plant & Machinery"; ws["C%d" % (29 + o)] = cfg.get("pm_value")
+    ws["D%d" % (29 + o)] = round(pm, 2) if pm is not None else None
     if cfg.get("pm_value") is not None and pm is not None:
-        ws["E29"] = "Adequately Insured" if pm >= cfg["pm_value"] else "Inadequately Insured"
-    for c, v in (("B31", "Address of collateral"), ("C31", "Assets value (Rs. Lakhs)"), ("D31", "Insured Value (Rs. In Lakhs)"), ("E31", "Remarks")):
-        ws[c] = v
-    ws["B32"] = cfg.get("collateral_address") or (_addr(fire[0].get("location")) if fire else "")
+        ws["E%d" % (29 + o)] = "Adequately Insured" if pm >= cfg["pm_value"] else "Inadequately Insured"
+    for c, v in (("B", "Address of collateral"), ("C", "Assets value (Rs. Lakhs)"), ("D", "Insured Value (Rs. In Lakhs)"), ("E", "Remarks")):
+        ws["%s%d" % (c, 31 + o)] = v
+    ws["B%d" % (32 + o)] = cfg.get("collateral_address") or (_addr(fire[0].get("location")) if fire else "")
     cv = cfg.get("collateral_value")
     if cv is None and F.get("collateral"):
         cv = round(F["collateral"]["value"] / 1e5, 5)
-    ws["C32"] = cv; ws["D32"] = round(bld, 2) if bld is not None else None
+    ws["C%d" % (32 + o)] = cv; ws["D%d" % (32 + o)] = round(bld, 2) if bld is not None else None
     cfg = dict(cfg, collateral_value=cv)
     if cfg.get("collateral_value") is not None and bld is not None:
-        ws["E32"] = "Adequately Insured" if bld >= cfg["collateral_value"] else "Inadequately Insured"
+        ws["E%d" % (32 + o)] = "Adequately Insured" if bld >= cfg["collateral_value"] else "Inadequately Insured"
 
 
 GST_STATES = {"01": "Jammu and Kashmir", "02": "Himachal Pradesh", "03": "Punjab", "04": "Chandigarh", "05": "Uttarakhand",
@@ -1790,10 +1902,22 @@ def _mname(ym):
     return dt.date(ym[0], ym[1], 1).strftime("%B")
 
 
+# due dates extended by the government (add a line when CBIC extends one): (return, tax period) -> new due date
+GST_DUE_EXT = {("3B", (2025, 9)): dt.date(2025, 10, 25)}       # GSTR-3B Sep-2025 extended to 25-10-2025
+
+
+def gst_due(kind, ym):
+    y, m = ym
+    return GST_DUE_EXT.get((kind, ym)) or dt.date(y + (m == 12), m % 12 + 1, 20 if kind == "3B" else 11)
+
+
 def _ret_rows(ws, rows, col, top, kind, n):
     L = openpyxl.utils.get_column_letter; c0 = openpyxl.utils.column_index_from_string(col)
-    for i, r in enumerate(sorted(rows, key=lambda r: r["ym"], reverse=True)[:n]):
-        y, m = r["ym"]; due = dt.date(y + (m == 12), m % 12 + 1, 20 if kind == "3B" else 11)
+    one = {}
+    for r in rows:                                    # the same return uploaded twice ('..._012025 (1).pdf') -> once
+        one.setdefault(r["ym"], r)
+    for i, r in enumerate(sorted(one.values(), key=lambda r: r["ym"], reverse=True)[:n]):
+        due = gst_due(kind, r["ym"])
         fd = d(r["arn"]) if r.get("arn") else None
         vals = [_fy(r["ym"]), _mname(r["ym"]), due, fd, ("Timely Filed" if fd <= due else "Late Filed") if fd else "Filing date not found"]
         for k, v in enumerate(vals):
@@ -1853,7 +1977,7 @@ def draft_gst(ws, F, cfg):
         v = paid.get(ym)
         if not v:
             continue
-        due = dt.date(ym[0] + (ym[1] == 12), ym[1] % 12 + 1, 20)
+        due = gst_due("3B", ym)
         for c, x in zip("JKLMN", ("GST Challan", _mname(ym), v["amount"], v["paid"], "Timely Filed" if v["paid"] <= due else "Late Filed")):
             ws["%s%d" % (c, 3 + i)] = x
     for c, v in zip("BCDEF", ("Particulars", "Month", "Amount (Rs.)", "Date Paid", "Remarks")):
