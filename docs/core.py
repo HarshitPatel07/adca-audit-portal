@@ -520,6 +520,25 @@ def tally_purchase(rows, head):
     (Gold Star Oct-25 18,147,329.12 = the draft's purchase column)."""
     if "Purchase Accounts" not in head:
         return None
+    if re.search(r"Monthly\s*Summary", head):
+        # 'Group Monthly Summary' (Bhawani): month | Debit | Credit | Closing -> net purchase of the month = Debit - Credit
+        st = re.search(r"\b1-([A-Za-z]{3})-(\d{2,4}) to", head)
+        if not st:
+            return None
+        y = int(st.group(2)); y = y + 2000 if y < 100 else y; mo = MON[st.group(1).lower()]
+        names = [dt.date(2000, i, 1).strftime("%B") for i in range(1, 13)]
+        out = {}
+        for r in rows:
+            nm = str(r[0] or "").strip()
+            if nm not in names:
+                continue
+            vals = [_cellnum(c) for c in r[1:3]]
+            mi = names.index(nm) + 1
+            while mi != mo:
+                mo = mo % 12 + 1; y += (mo == 1)
+            if vals[0] is not None:
+                out[(y, mo)] = round(vals[0] - (vals[1] or 0), 2)
+        return out or None
     m = re.search(r"\b1-([A-Za-z]{3})-(\d{2,4}) to (\d{1,2}-[A-Za-z]{3}-\d{2,4})", head)
     end = d(m.group(3)) if m else None
     if not end or MON.get(m.group(1).lower()) != end.month:
@@ -1342,6 +1361,8 @@ def scan(paths, log):
                             cred = k == "Sundry Creditors"
                             n = tally_pdf_names(t); F["creditors" if cred else "debtors"].update(n)
                             tt = tally_pdf_totals(t, cred); F["cred_tot" if cred else "deb_tot"].extend(tt)
+                            if re.search(r"as\s*on", fn, re.I) and len(tt) == 1:     # 'Debtors as on 30-09-2025.pdf'
+                                F.setdefault("points", set()).add(tt[0]["date"])     # a position taken for the audit
                             log.append(("Creditor ledger" if cred else "Debtor ledger", fn, "%d names (PDF)%s" % (len(n), (
                                 "; closing %s" % ", ".join("%s %.2f lakh" % (x["date"].strftime("%d-%m-%Y"), (x["cr"] if cred else x["dr"] - x["cr"]) / 1e5)
                                                            for x in tt[-3:])) if tt else "")))
@@ -1394,7 +1415,11 @@ def scan(paths, log):
             elif ext == "txt":
                 t = open(p, encoding="utf-8", errors="replace").read()
                 if "STATEMENT" in t and "BALANCE" in t:
-                    a, tx = bank_txt(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); F["bank_name"][a] = F["bank_name"].get(a) or bank_of(t); log.append(("Bank TXT", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
+                    a, tx = bank_txt(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); F["bank_name"][a] = F["bank_name"].get(a) or bank_of(t)
+                    sc = re.search(r"SCHEME CODE:\s*(.+?)\s{2,}", t)
+                    if sc:
+                        F.setdefault("bank_scheme", {})[a] = sc.group(1).strip()
+                    log.append(("Bank TXT", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
             elif ext in ("xlsx", "xlsm", "csv", "xls") and re.search(OUT_YES, fn, re.I) and not re.search(OUT_NO, fn, re.I) \
                     and outward_file(F, p, log):
                 pass                                          # outward-supply data read for the GST summary
@@ -1969,8 +1994,13 @@ def draft_summation(ws, F, cfg, allc):
     cc = next((a for a, tx in accs if _is_cc(dedupe(tx))), accs[0][0] if accs else "")
     # check page left the bank blank -> the bank named in the CC statement's header (Gold Star: 'A X I S  B A N K')
     bank1 = banks[0][0] if banks and banks[0][0] else ((F.get("bank_name") or {}).get(cc) or "Bank")
-    ca = next((a for a, tx in accs if a != cc), None)
+    ods = sorted([a for a, tx in accs if a != cc and _is_cc(dedupe(tx))],   # more overdrawn accounts (Bhawani: 2 OD),
+                 key=lambda a: min(t.get("src", "") for t in F["bank"][a]))  # in file order as the draft lists them
+    ca = next((a for a, tx in accs if a != cc and a not in ods), None)
     inp = lambda t: start <= (t["date"].year, t["date"].month) <= base
+    def lab(acc, dflt):                                 # 'CASH CREDIT SME PLUS' -> 'Cash Credit'; else the scheme as printed
+        sc = (F.get("bank_scheme") or {}).get(acc, "")
+        return "Cash Credit" if re.search(r"CASH CREDIT", sc) else (sc or dflt)
 
     def sums(acc):
         if not acc or acc not in F["bank"]:
@@ -1982,8 +2012,8 @@ def draft_summation(ws, F, cfg, allc):
         cr = sum(t["amt"] for t in tx if t["amt"] > 0) - ex
         return _lakh(dr), _lakh(cr)
 
-    ws["B2"] = " Cash Credit A/C %s Bank: %s   " % (_short_bank(bank1), cc)
-    ws["F2"] = " Current A/C %s Bank: %s" % (_short_bank(bank1), ca or "")
+    ws["B2"] = " %s A/C %s Bank: %s   " % (lab(cc, "Cash Credit"), _short_bank(bank1), cc)
+    ws["F2"] = " %s A/C %s Bank: %s" % (lab(ca, "Current") if ca else "Current", _short_bank(bank1), ca or "")
     for c, v in (("B3", "Period"), ("C3", "Debit Summation"), ("D3", "Credit Summation"),
                  ("F3", "Period"), ("G3", "Debit Summation"), ("H3", "Credit Summation")):
         ws[c] = v
@@ -1992,7 +2022,25 @@ def draft_summation(ws, F, cfg, allc):
         ws["F4"] = per; ws["G4"], ws["H4"] = sums(ca)
     ws["B5"] = "Total"; ws["C5"] = "=SUM(C4:C4)"; ws["D5"] = "=SUM(D4:D4)"
     ws["F5"] = "Total"; ws["G5"] = "=SUM(G4:G4)"; ws["H5"] = "=SUM(H4:H4)"
-    ws["B9"] = "Particulars"; ws["C9"] = "Amount (In lakhs)"
+    # each further overdrawn account: its own block of 6 rows below (as the Bhawani draft), styled like rows 2-5
+    o = 6 * len(ods)
+    if o:
+        _grow(ws, 8, o)
+        from copy import copy
+        for k, acc in enumerate(ods):
+            r0 = 8 + 6 * k
+            for i in range(4):
+                for col in range(2, 5):
+                    src, dst = ws.cell(2 + i, col), ws.cell(r0 + i, col)
+                    if src.has_style:
+                        dst._style = copy(src._style)
+            ws["B%d" % r0] = " %s A/C %s Bank: %s" % (lab(acc, "Overdraft"), _short_bank(bank1), acc)
+            ws["B%d" % (r0 + 1)], ws["C%d" % (r0 + 1)], ws["D%d" % (r0 + 1)] = "Period", "Debit Summation", "Credit Summation"
+            ws["B%d" % (r0 + 2)] = per; ws["C%d" % (r0 + 2)], ws["D%d" % (r0 + 2)] = sums(acc)
+            ws["B%d" % (r0 + 3)] = "Total"
+            ws["C%d" % (r0 + 3)], ws["D%d" % (r0 + 3)] = "=SUM(C%d:C%d)" % (r0 + 2, r0 + 2), "=SUM(D%d:D%d)" % (r0 + 2, r0 + 2)
+    R = lambda r: r + o
+    ws["B%d" % R(9)] = "Particulars"; ws["C%d" % R(9)] = "Amount (In lakhs)"
     opening = _book_total(F.get("deb_tot", []), _ym_add(start, -1))
     closing = _book_total(F.get("deb_tot", []), base)
     # sales = GSTR-3B 3.1 (a)+(b)+(c) per month; a month without a 3B -> GSTR-1, then the books sales register
@@ -2002,22 +2050,22 @@ def draft_summation(ws, F, cfg, allc):
     vals = [g3.get(m, g1.get(m, bk.get(m))) for m in months]
     miss = [_mlab(m) for m, v in zip(months, vals) if v is None]
     sales = sum(v for v in vals if v is not None) if len(miss) < len(months) else None
-    ws["B10"] = "Opening Debtors as on %s" % dt.date(start[0], start[1], 1).strftime("%d-%m-%Y"); ws["C10"] = _lakh(opening)
-    ws["B11"] = "Add: Sales during %s" % per + (" (no GST return / books sales for %s)" % ", ".join(miss) if miss and sales is not None else "")
-    ws["C11"] = _lakh(sales)
-    ws["B12"] = "Less: Closing Debtors as on %s" % month_end(*base).strftime("%d-%m-%Y"); ws["C12"] = _lakh(closing)
-    ws["B13"] = "Sales Realization during %s" % per; ws["C13"] = "=C10+C11-C12"
+    ws["B%d" % R(10)] = "Opening Debtors as on %s" % dt.date(start[0], start[1], 1).strftime("%d-%m-%Y"); ws["C%d" % R(10)] = _lakh(opening)
+    ws["B%d" % R(11)] = "Add: Sales during %s" % per + (" (no GST return / books sales for %s)" % ", ".join(miss) if miss and sales is not None else "")
+    ws["C%d" % R(11)] = _lakh(sales)
+    ws["B%d" % R(12)] = "Less: Closing Debtors as on %s" % month_end(*base).strftime("%d-%m-%Y"); ws["C%d" % R(12)] = _lakh(closing)
+    ws["B%d" % R(13)] = "Sales Realization during %s" % per; ws["C%d" % R(13)] = "=C%d+C%d-C%d" % (R(10), R(11), R(12))
     b2 = banks[1] if len(banks) > 1 else ("", None)
     sh1 = _short_bank(bank1); sh2 = _short_bank(b2[0]) if b2[0] else "other"
-    ws["B14"] = "Limit Sanctioned (%s bank)" % sh1; ws["C14"] = banks[0][1] if banks else None
-    ws["B15"] = "Limit Sanctioned (%s bank)" % sh2; ws["C15"] = b2[1] if b2[1] is not None else 0
-    ws["B16"] = "Total Limit Sanctioned"; ws["C16"] = "=C14+C15"
-    ws["B17"] = "Proportionate DP for %s Bank Ltd." % sh1; ws["C17"] = "=C14*C13/C16"
-    ws["B18"] = "Proportionate DP for %s Bank Ltd." % sh2; ws["C18"] = "=C13*C15/C16"
-    ws["B19"] = "Routed In %s – CC" % sh1; ws["C19"] = "=D5"
-    ws["B20"] = "Routed In %s – CA" % sh1; ws["C20"] = "=H5" if ca else 0
-    ws["B21"] = "Total Receipt In %s" % sh1; ws["C21"] = "=C19+C20"
-    ws["B22"] = "Sales Realization in %"; ws["C22"] = "=C21/C17%"
+    ws["B%d" % R(14)] = "Limit Sanctioned (%s bank)" % sh1; ws["C%d" % R(14)] = banks[0][1] if banks else None
+    ws["B%d" % R(15)] = "Limit Sanctioned (%s bank)" % sh2; ws["C%d" % R(15)] = b2[1] if b2[1] is not None else 0
+    ws["B%d" % R(16)] = "Total Limit Sanctioned"; ws["C%d" % R(16)] = "=C%d+C%d" % (R(14), R(15))
+    ws["B%d" % R(17)] = "Proportionate DP for %s Bank Ltd." % sh1; ws["C%d" % R(17)] = "=IFERROR(C%d*C%d/C%d,C%d)" % (R(14), R(13), R(16), R(13))
+    ws["B%d" % R(18)] = "Proportionate DP for %s Bank Ltd." % sh2; ws["C%d" % R(18)] = "=IFERROR(C%d*C%d/C%d,0)" % (R(13), R(15), R(16))
+    ws["B%d" % R(19)] = "Routed In %s – CC" % sh1; ws["C%d" % R(19)] = "=D5" + "".join("+D%d" % (8 + 6 * k + 3) for k in range(len(ods)))
+    ws["B%d" % R(20)] = "Routed In %s – CA" % sh1; ws["C%d" % R(20)] = "=H5" if ca else 0
+    ws["B%d" % R(21)] = "Total Receipt In %s" % sh1; ws["C%d" % R(21)] = "=C%d+C%d" % (R(19), R(20))
+    ws["B%d" % R(22)] = "Sales Realization in %"; ws["C%d" % R(22)] = "=IFERROR(C%d/C%d%%,\"\")" % (R(21), R(17))
 
 
 def _addr(a):
@@ -2328,17 +2376,32 @@ def _bal_on(F, acc, day):
 
 def fw_ctx(F, cfg):
     """Everything the five sheets need, from the documents (lakh = Rs / 1e5). None = no source -> blank cell."""
-    base = month_end(*cfg["sum_to"])
     books = {}
     for b in F["book"]:
         if b.get("date"):
             books[b["date"]] = max(books.get(b["date"], 0), b["stock"])
     ss = {s["date"]: s for s in F["ss"] if s.get("date")}
     ages = {a["date"]: a for a in F.get("ageing", [])}
-    visit = cfg.get("visit") or max([x for x in books if x > base] or [None], key=lambda x: x or dt.date.min)
+    points = sorted(F.get("points") or [])
+    # visit date: typed; else the latest 'as on' position (Bhawani: Debtors / Creditors as on 17-12-2025); else latest books
+    visit = cfg.get("visit") or (points[-1] if points else max(books, default=None))
+    # base date (DP and holdings): latest date with BOTH a stock statement (not OCR-read) and books, within 6 months
+    # before the visit; else an 'as on' position before it (Bhawani 30-09-2025); else the latest book month-end before it
+    near = lambda x: visit is None or (x < visit and (visit - x).days <= 190)
+    good_ss = [x for x, s in ss.items() if not s.get("check")]
+    base = max([x for x in good_ss if x in books and near(x)] or [x for x in good_ss if near(x)] or
+               [x for x in points if near(x)] or [x for x in books if near(x) and x == month_end(x.year, x.month)] or
+               [month_end(*cfg["sum_to"])])
+    if cfg.get("dp_base"):
+        base = cfg["dp_base"]
+    if visit is not None and visit <= base:
+        visit = None
     # stock dates of the holding tables: as the Insurance rows (month before the period .. period end)
-    lo = _ym_add(cfg["sum_from"], -1)
-    inwin = lambda xs: sorted(x for x in xs if lo <= (x.year, x.month) and x <= base)
+    # holding rows (all 5 drafts): 12 months ending at the summation end, not before the month before its start
+    # (Gold Dec'25-Jun'26 quarterly, Baid Apr'25-Feb'26, Clan Jul'25-Jun'26, Denis Sep'25-Aug'26, Bhawani Nov'24-Oct'25)
+    lo = max(_ym_add(cfg["sum_to"], -11), _ym_add(cfg["sum_from"], -1))
+    hi = month_end(*cfg["sum_to"])
+    inwin = lambda xs: sorted(x for x in xs if lo <= (x.year, x.month) and x <= hi and x == month_end(x.year, x.month))
     dates = inwin(books) or inwin(ss)
     step = 1
     if len(dates) > 1:
@@ -2364,20 +2427,25 @@ def fw_facility(ws, F, cfg, X):
     bn = X["base"].strftime("%d-%m-%Y"); vn = X["visit"].strftime("%d-%m-%Y") if X["visit"] else ""
     ws["A2"], ws["B2"], ws["C2"], ws["E2"] = "Particulars", "Limits Sanctioned", "As on " + bn, ("As on " + vn) if vn else None
     ws["C3"], ws["D3"], ws["E3"], ws["F3"] = "DP", bank1, "DP", bank1
-    ws["A4"], ws["B4"] = "Cash Credit", b1[1]
+    ws["A4"], ws["B4"] = (b1[2] if len(b1) > 2 and b1[2] else "Cash Credit"), b1[1]
     ws["C4"], ws["E4"] = "='DP calculation'!D21", "='DP calculation'!E21"
     ws["D4"] = X["L"](_bal_on(F, X["cc"], X["base"])) if X["cc"] else None
     ws["F4"] = X["L"](_bal_on(F, X["cc"], X["visit"])) if X["cc"] and X["visit"] else None
     extra = cfg.get("facilities") or []           # typed: name, limit, o/s on base date, o/s on visit date
-    for i, f in enumerate(extra[:1]):
-        ws["A5"], ws["B5"], ws["C5"], ws["D5"], ws["E5"], ws["F5"] = f[0], f[1], "NA", f[2], "NA", f[3]
-    ws["A6"] = "Total Exposure"
+    k = max(0, len(extra) - 1)
+    _grow(ws, 6, k)                                 # more than one other facility (Bhawani: 10) -> rows added
+    for i, f in enumerate(extra):
+        r = 5 + i
+        ws["A%d" % r], ws["B%d" % r], ws["C%d" % r], ws["D%d" % r], ws["E%d" % r], ws["F%d" % r] = f[0], f[1], "NA", f[2], "NA", f[3]
+    tr = 6 + k
+    ws["A%d" % tr] = "Total Exposure"
     for c in "BCDEF":
-        ws[c + "6"] = "=SUM(%s4:%s5)" % (c, c)
+        ws["%s%d" % (c, tr)] = "=SUM(%s4:%s%d)" % (c, c, tr - 1)
     b2 = banks[1] if len(banks) > 1 else None
-    ws["A10"], ws["B10"] = "Particulars(%s)" % (_short_bank(b2[0]) + " bank" if b2 else "other bank"), "Limits Sanctioned"
+    ws["A%d" % (10 + k)], ws["B%d" % (10 + k)] = "Particulars(%s)" % (_short_bank(b2[0]) + " bank" if b2 else "other bank"), "Limits Sanctioned"
     if b2:
-        ws["A12"], ws["B12"] = (b2[2] if len(b2) > 2 and b2[2] else "Fund based limit"), b2[1]
+        ws["A%d" % (12 + k)], ws["B%d" % (12 + k)] = (b2[2] if len(b2) > 2 and b2[2] else "Fund based limit"), b2[1]
+    return k
 
 
 def fw_dp(ws, F, cfg, X):
@@ -2405,19 +2473,24 @@ def fw_dp(ws, F, cfg, X):
            "D": dict(stock=X["books"].get(base), cred=L(_at(F["cred_tot"], base, creditors=True)), deb=L(_at(F["deb_tot"], base)),
                      lt=L(ab["lt90"]) if ab else None, assoc=L(asb) if ab else None)}
     if v:
-        col["E"] = dict(stock=X["books"].get(v), cred=L(_at(F["cred_tot"], v, creditors=True)), deb=L(_at(F["deb_tot"], v)),
+        col["E"] = dict(stock=X["books"].get(v, cfg.get("visit_stock")), cred=L(_at(F["cred_tot"], v, creditors=True)), deb=L(_at(F["deb_tot"], v)),
                         lt=L(av["lt90"]) if av else None, assoc=L(asv) if av else None)
+    no_age = []
     for c, x in col.items():
+        if x["lt"] is None and x["deb"] is not None:   # no ageing in the documents: books / SS give the total only ->
+            x["lt"] = x["deb"]; no_age.append(c)       # all taken as < 90 days, as the drafts do (Bhawani), and noted
         ws[c + "3"], ws[c + "4"], ws[c + "8"], ws[c + "9"], ws[c + "10"] = x["stock"], x["cred"], x["deb"], x["lt"], x["assoc"] or 0
         ws[c + "5"] = "=%s3-%s4" % (c, c); ws[c + "6"] = "=%s5*25%%" % c; ws[c + "7"] = "=%s5-%s6" % (c, c)
         ws[c + "11"] = "=%s9-%s10" % (c, c); ws[c + "12"] = "=%s11*25%%" % c; ws[c + "13"] = "=%s11-%s12" % (c, c)
         ws[c + "14"] = "=%s8-%s9" % (c, c); ws[c + "15"] = "=%s7+%s13" % (c, c)
-        ws[c + "16"] = "='Facility sanctioned'!B4"; ws[c + "17"] = "='Facility sanctioned'!B12"; ws[c + "18"] = "=%s16+%s17" % (c, c)
-        ws[c + "19"] = "=%s15*%s16/%s18" % (c, c, c); ws[c + "20"] = "=%s15*%s17/%s18" % (c, c, c)
-        ws[c + "21"] = "=+MIN(%s16,%s19)" % (c, c)
+        ws[c + "16"] = "='Facility sanctioned'!B4"; ws[c + "17"] = "='Facility sanctioned'!B%d" % (12 + X.get("fk", 0)); ws[c + "18"] = "=%s16+%s17" % (c, c)
+        ws[c + "19"] = "=IFERROR(%s15*%s16/%s18,%s15)" % (c, c, c, c); ws[c + "20"] = "=IFERROR(%s15*%s17/%s18,0)" % (c, c, c)
+        ws[c + "21"] = '=IF(N(%s16)=0,%s19,MIN(%s16,%s19))' % (c, c, c, c)
         ws[c + "22"] = "='Facility sanctioned'!$D$4" if c != "E" else "='Facility sanctioned'!F4"
         ws[c + "23"] = "=IF(N(%s22)>%s21,%s22-%s21,0)" % (c, c, c, c)
         ws[c + "24"] = '=IF(N(%s22)>%s21,IF(%s22<=%s16,"Over Utilised against DP but within the sanction limit","Over Utilised beyond the sanction limit"),"Regular")' % (c, c, c, c)
+    if no_age:
+        ws["G9"] = "No debtor ageing in the documents for column %s - total debtors taken as < 90 days" % "/".join(no_age)
     ws["B26"], ws["C26"], ws["D26"], ws["E26"] = "Debtors as on", "< 90 Days", "> 90 Days", "Total"
     rowsd = [("As on %s (As per Stock SS)" % bn, "C"), ("As on %s (As per Books)" % bn, "D")] + \
             ([("As on Visit Date %s (As per Books)" % vn, "E")] if v else [])
@@ -2669,7 +2742,7 @@ def build_excel_draft(F, cfg, out):
     draft_invoice(wb["Invoice"] if "Invoice" in wb.sheetnames else wb.create_sheet("Invoice", 0), F, cfg)
     if "Facility sanctioned" in wb.sheetnames:          # the firm's full workbook (9 sheets)
         X = fw_ctx(F, cfg); P = fw_periods(F, X)
-        fw_facility(wb["Facility sanctioned"], F, cfg, X)
+        X["fk"] = fw_facility(wb["Facility sanctioned"], F, cfg, X)
         fw_dp(wb["DP calculation"], F, cfg, X)
         so = fw_stock(wb["Stock Holding"], F, cfg, X, P)
         fw_debtors(wb["Debtors Holding"], F, cfg, X, P, so)
@@ -2691,7 +2764,7 @@ def default_period(F):
     that the bank statements cover. A stock date outside the statements (Denis: only Mar'25 read, bank Sep'25-Aug'26)
     would give a period with no bank rows, so the bank's last month is used then."""
     bank = [t["date"] for tx in F["bank"].values() for t in tx]
-    ss = [s["date"] for s in F["ss"] if s.get("date")]
+    ss = [s["date"] for s in F["ss"] if s.get("date") and not s.get("check")]   # an OCR-read date never sets the period
     book = [s["date"] for s in F["book"] if s.get("date")]       # books only when no stock statement fits (the
     if bank:                                                      # latest book stock is often the visit date)
         lo, hi = min(bank), max(bank)
