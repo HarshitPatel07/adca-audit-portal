@@ -229,6 +229,206 @@ def gstr1(t):
                 taxable=round(b2b + b2cl + b2cs + exp + sez + cdnr + cdnur + amd, 2), arn=arn.group(1) if arn else "")
 
 
+# ---------------- outward supply, taxable value only (the GST master prompt) ----------------
+GSTIN_RX = r"\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z]"
+OUT_YES = r"outward|\bsales?\b|gstr[-\s_]*1(?!\d)|\bR1\b|\bb2b\b|\bb2c[ls]?\b|\bexp(?:ort)?s?\b|sr\d|dr[-\s/]*cr|credit\s*note|debit\s*note"
+OUT_NO = r"purchase|inward|gstr[-\s_]*2|gstr[-\s_]*3|\b2a\b|\b2b\b|\bitc\b|rcm|reverse charge|hsn|advance|documents issued"
+NOT_TAXABLE = r"nil\s*rated|exempt|non[-\s]*gst"
+
+
+def sheet_tables(p):
+    """[(sheet name, rows)] of an Excel / CSV file: .xlsx/.xlsm (openpyxl), .xls (xlrd), .csv. Trailing blank rows of a
+    sheet formatted to a million rows are cut after 300 empty rows."""
+    ext = p.lower().rsplit(".", 1)[-1]
+    out = []
+    try:
+        if ext == "csv":
+            import csv
+            with open(p, encoding="utf-8", errors="replace", newline="") as fh:
+                out.append((os.path.basename(p), [r for r in csv.reader(fh)]))
+        elif ext == "xls":
+            import xlrd
+            wb = xlrd.open_workbook(p)
+            for sh in wb.sheets():
+                rows = []
+                for i in range(sh.nrows):
+                    r = []
+                    for c in sh.row(i):
+                        v = c.value
+                        if c.ctype == xlrd.XL_CELL_DATE:
+                            try:
+                                v = xlrd.xldate.xldate_as_datetime(v, wb.datemode)
+                            except Exception:
+                                pass
+                        r.append(None if v == "" else v)
+                    rows.append(r)
+                out.append((sh.name, rows))
+        else:
+            wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+            for ws in wb.worksheets:
+                rows, blank = [], 0
+                for r in ws.iter_rows(values_only=True):
+                    if any(c is not None and str(c).strip() for c in r):
+                        rows.append(list(r)); blank = 0
+                    else:
+                        blank += 1
+                        if blank > 300:
+                            break
+                out.append((ws.title, rows))
+            wb.close()
+    except Exception:
+        return []
+    return out
+
+
+def outward_file(F, p, log):
+    """Read one outward-supply workbook into F['out'] (rows) and F['out_notes']; True if it held any."""
+    rows, notes = outward_rows(p, sheet_tables(p))
+    if not rows and not any("cancelled" in n for n in notes):
+        return False
+    F.setdefault("out", []).extend(rows); F.setdefault("out_notes", []).extend(notes)
+    tax = sum(r["value"] for r in rows if not r["nontax"])
+    log.append(("GST outward", os.path.basename(p), "%d rows, taxable %s (%s)" % (len(rows), "{:,.2f}".format(tax),
+                                                                                "; ".join(n.split(": ", 1)[-1] for n in notes)[:200])))
+    return True
+
+
+def _hdr(c):
+    return " ".join(str(c or "").replace("\n", " ").split()).lower()
+
+
+def _cell_date(v):
+    if isinstance(v, dt.datetime):
+        return v.date()
+    if isinstance(v, dt.date):
+        return v
+    s = str(v or "").strip()
+    for f in ("%d-%m-%Y", "%d/%m/%Y", "%d-%b-%Y", "%d-%b-%y", "%d.%m.%Y", "%Y-%m-%d", "%d-%m-%y", "%d/%m/%y", "%d %b %Y"):
+        try:
+            return dt.datetime.strptime(s[:11].strip(), f).date()
+        except ValueError:
+            pass
+    return None
+
+
+def outward_rows(p, sheets, own_gstin=""):
+    """Rows of outward-supply data (invoice / line / note level) found in a workbook, per the master prompt:
+    taxable value only (tax and invoice-value columns never read), month from the document date (a note's own date),
+    credit note minus / debit note plus, nil / exempt / non-GST tables kept apart. Returns (rows, notes)."""
+    fn = os.path.basename(p)
+    if re.search(OUT_NO, fn, re.I) or not re.search(OUT_YES, fn, re.I):
+        name_ok = False
+    else:
+        name_ok = True
+    fgst = re.search(GSTIN_RX, fn)
+    out, notes = [], []
+    for sname, rows in sheets:
+        top = " ".join(_hdr(c) for r in rows[:4] for c in r if c)
+        title = sname.lower() + " " + top
+        if re.search(OUT_NO, sname, re.I) or re.search(r"\binward\b|purchase|gstr[-\s_]*2[ab]\b|\b2[ab]\b", top):
+            continue
+        if not (name_ok or re.search(OUT_YES, title, re.I)):
+            continue
+        for hi, r in enumerate(rows[:20]):
+            h = [_hdr(c) for c in r]
+            tv = next((j for j, c in enumerate(h) if re.fullmatch(r"(taxable|assessable)\s*(value|amount|amt)( \(.*\))?|value \(before tax\)|taxable value \(₹\)", c)), None)
+            if tv is None:
+                continue
+            dates = [j for j, c in enumerate(h) if "date" in c and "shipping" not in c and "port" not in c]
+            note_d = [j for j in dates if re.search(r"note|voucher|document|dr/ cr|dr/cr|refund", h[j])]
+            di = (note_d or dates or [None])[0]
+            per = next((j for j, c in enumerate(h) if re.search(r"return period|tax period|\bperiod\b|\bmonth\b", c)), None)
+            # the note's OWN number - never 'Original Invoice / Debit Note No.' (an older invoice, often last year's)
+            no = next((j for j, c in enumerate(h) if re.search(r"(note|voucher)\s*(no|number)|dr/ ?cr note no", c)
+                       and not c.startswith("original")), None) if note_d else None
+            no = no if no is not None else next((j for j, c in enumerate(h) if re.search(r"invoice\s*(no|number)|inv\.?\s*no|voucher\s*no|bill\s*no|document\s*(no|number)", c)), None)
+            line = next((j for j, c in enumerate(h) if "line" in c and ("sr" in c or "no" in c)), None)
+            dtyp = next((j for j, c in enumerate(h) if re.search(r"document\s*type|voucher\s*type|note\s*type|doc\.?\s*type|^type of note", c)), None)
+            gi = next((j for j, c in enumerate(h) if re.search(r"gstin|gst\s*no|registration", c) and not re.search(r"recip|receip|buyer|party|customer|counter", c)), None)
+            nontax = bool(re.search(NOT_TAXABLE, title, re.I))
+            kind = "note" if note_d or re.search(r"credit|debit|cdn|dr[-\s/]*cr", title, re.I) else "invoice"
+            used = skip_blank = 0
+            cancel_from, cancelled = None, []
+            for k, rr in enumerate(rows[hi + 1:], hi + 2):
+                g = lambda j: rr[j] if j is not None and j < len(rr) else None
+                txt = " ".join(str(c) for c in rr if isinstance(c, str))
+                # 'following Invoice Cancel' (a text-only line): every row below it is a cancelled invoice (Denis Feb-26:
+                # 7 invoices, 15,43,541.50 - exactly what the filed GSTR-1 leaves out); '(cancelled )' rows likewise
+                filled = [c for c in rr if c is not None and str(c).strip()]
+                if cancel_from is None and re.search(r"cancel", txt, re.I) and not re.search(r"\(\s*cancel", txt, re.I) \
+                        and len(filled) <= 3 and all(isinstance(c, str) for c in filled):
+                    cancel_from = k; continue
+                if cancel_from is not None or re.search(r"\(\s*cancel", txt, re.I):
+                    cv = g(tv)
+                    cn = str(g(no) or "").strip()
+                    if not re.search(r"\d", cn) or re.match(r"\d{2}-[A-Za-z]", cn):      # columns shift in this section
+                        cn = next((str(c).strip() for c in rr if isinstance(c, str) and re.search(r"\d", c) and re.search(r"[/-]|^[A-Z]{2}\d", c.strip())
+                                   and not re.fullmatch(GSTIN_RX, c.strip()) and not re.match(r"\d{2}-[A-Za-z]", c.strip())), "")
+                    if isinstance(cv, (int, float)) and cv and cn:          # a document, not the section's sub-total line
+                        cancelled.append((cn, cv))
+                    continue
+                v = g(tv)
+                if isinstance(v, str):
+                    try:
+                        v = float(v.replace(",", "").strip())
+                    except ValueError:
+                        v = None
+                inv = str(g(no) or "").strip()
+                day = _cell_date(g(di)) if di is not None else None
+                if day is None and per is not None:
+                    pv = g(per); pd_ = _cell_date(pv) or (lambda m: dt.date(int(m.group(2)) + (2000 if len(m.group(2)) == 2 else 0), MON[m.group(1)[:3].lower()], 1) if m else None)(
+                        re.match(r"\s*([A-Za-z]{3,9})[\s'-]*(\d{2,4})", str(pv or "")))
+                    day = pd_
+                if not inv and day is None:
+                    continue                                  # a total / sub-total line, not a document
+                fixed = None
+                fym = re.search(r"(?<!\d)(?:20)?(\d{2})-(\d{2})(?!\d)", inv) or re.search(r"\b[A-Z]{1,4}[-/](\d{2})(\d{2})[-/]", inv)
+                if day and fym and int(fym.group(2)) == (int(fym.group(1)) + 1) % 100:
+                    fy0 = 2000 + int(fym.group(1))            # 'EXP061/2025-26' dated 2025-02-xx: year typed wrong
+                    if not dt.date(fy0, 4, 1) <= day <= dt.date(fy0 + 1, 3, 31):
+                        try:
+                            nd = day.replace(year=fy0 if day.month >= 4 else fy0 + 1)
+                        except ValueError:
+                            nd = None
+                        if nd:
+                            fixed, day = day, nd
+                if v is None or not isinstance(v, (int, float)):
+                    skip_blank += 1; continue
+                if day is None:
+                    skip_blank += 1; continue
+                t = str(g(dtyp) or "").strip().lower()
+                doc = "invoice"
+                if re.match(r"c\b|credit|cr\b|cn\b", t):
+                    doc = "credit"
+                elif re.match(r"d\b|debit|dr\b|dn\b", t):
+                    doc = "debit"
+                elif re.match(r"r\b|refund", t):
+                    notes.append("%s / %s row %d: refund voucher - not a supply, left out" % (fn, sname, k)); continue
+                elif kind == "note":
+                    has_c, has_d = bool(re.search(r"credit", title)), bool(re.search(r"debit", title))
+                    if has_c != has_d:                # a credit-note-only or debit-note-only table
+                        doc = "credit" if has_c else "debit"
+                    else:                             # a notes table with no D / C column: not guessed
+                        notes.append("%s / %s row %d: note without a D / C type - left out, CHECK" % (fn, sname, k)); continue
+                gst = str(g(gi) or "").strip().upper() if gi is not None else ""
+                gst = gst or (fgst.group(0) if fgst else "") or own_gstin
+                # credit note always reduces, debit note always adds, whatever sign the sheet prints (Denis Oct-25 prints
+                # debit note DN/033 as -4,000 inside the notes table; the filed GSTR-1 counts it +4,000)
+                val = -abs(v) if doc == "credit" else (abs(v) if doc == "debit" else v)
+                out.append(dict(gstin=gst, ym=(day.year, day.month), value=round(val, 2), no=inv,
+                                day=day, line=str(g(line) or ""), kind=kind, nontax=nontax, src="%s / %s" % (fn, sname.strip()), row=k,
+                                fixed=fixed, doc=doc))
+                used += 1
+            if used or skip_blank:
+                notes.append("%s / %s: %d row(s) read%s%s" % (fn, sname.strip(), used, ", %d skipped (blank / non-numeric taxable value or no date)" % skip_blank if skip_blank else "",
+                                                              " - nil / exempt / non-GST, NOT taxable value" if nontax else ""))
+            if cancelled:
+                notes.append("%s / %s: %d cancelled invoice line(s) left out, taxable %s (%s)" % (
+                    fn, sname.strip(), len(cancelled), "{:,.2f}".format(sum(v for _, v in cancelled)), ", ".join(n for n, _ in cancelled[:12])))
+            break
+    return out, notes
+
+
 # ---------------- stock statement / books ----------------
 def stock_statement(t):
     f = t.replace("\n", "|")
@@ -1146,6 +1346,9 @@ def scan(paths, log):
                 t = open(p, encoding="utf-8", errors="replace").read()
                 if "STATEMENT" in t and "BALANCE" in t:
                     a, tx = bank_txt(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); F["bank_name"][a] = F["bank_name"].get(a) or bank_of(t); log.append(("Bank TXT", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
+            elif ext in ("xlsx", "xlsm", "csv", "xls") and re.search(OUT_YES, fn, re.I) and not re.search(OUT_NO, fn, re.I) \
+                    and outward_file(F, p, log):
+                pass                                          # outward-supply data read for the GST summary
             elif ext in ("xlsx", "xlsm", "csv"):
                 if ext == "csv":
                     rows = [l.rstrip("\n").split(",") for l in open(p, encoding="utf-8", errors="replace")]
@@ -2464,86 +2667,156 @@ def ai_merge(path, text):
     return browser_summary()
 
 
-# Month-wise GST taxable-value summary added after the existing user-format workbook is built.
+# ================= Month-wise outward supply, TAXABLE VALUE ONLY, all GSTINs (the GST master prompt) =================
+def gst_outward_summary(F):
+    """Steps of the master prompt, as fixed rules:
+    1 combine every outward table, GSTIN tagged (file / column, else the company's own GSTIN from its returns)
+    2 taxable value only   3 month = document date (MMM-YYYY)   4 credit note -, debit note +
+    5 GSTIN x month sums   6 invalid / blank GSTIN flagged      7 blank / non-numeric taxable skipped and counted
+    Duplicate uploads count once. A GSTIN-month with no invoice-level data is taken from the filed GSTR-1 (tax period).
+    Every month is also reconciled with the filed GSTR-1 of that period."""
+    own = sorted({r["gstin"] for r in F["g1"] + F["g3"] if re.fullmatch(GSTIN_RX, r["gstin"] or "")})
+    rows = F.get("out", [])
+    # duplicates: the same document line in two sheets / files (an 'SR Combine' sheet, a re-uploaded month) counts once
+    per_src = collections.defaultdict(collections.Counter)
+    first = {}
+    for r in rows:
+        g = r["gstin"] if re.fullmatch(GSTIN_RX, r["gstin"] or "") else (own[0] if len(own) == 1 and not r["gstin"] else r["gstin"])
+        r["g"] = g
+        key = (g, r["doc"], r["no"], r["day"], r["line"], r["value"], r["nontax"])
+        per_src[key][r["src"]] += 1
+        first.setdefault(key, r)
+    data, dups = [], 0
+    for key, by in per_src.items():
+        n = max(by.values()); dups += sum(by.values()) - n
+        data += [first[key]] * n
+    invalid = [r for r in data if not re.fullmatch(GSTIN_RX, r["g"] or "")]
+    good = [r for r in data if re.fullmatch(GSTIN_RX, r["g"] or "")]
+    inv = collections.defaultdict(float); nontax = collections.defaultdict(float)
+    for r in good:
+        (nontax if r["nontax"] else inv)[(r["g"], r["ym"])] += r["value"]
+    ret = {}
+    for r in F["g1"]:                                   # filed GSTR-1, one per GSTIN + tax period (latest ARN kept)
+        k = (r["gstin"], r["ym"]); q = ret.get(k)
+        if q is None or (d(r.get("arn") or "") or dt.date.min) > (d(q.get("arn") or "") or dt.date.min):
+            ret[k] = r
+    cells, src = {}, {}
+    for k, v in inv.items():
+        cells[k] = round(v, 2); src[k] = "invoice-level data"
+    for k, r in ret.items():
+        if k not in cells:
+            cells[k] = round(r["taxable"], 2); src[k] = "filed GSTR-1 (tax period)"
+    if not F["g1"]:                                     # no GSTR-1 at all (Baid): the filed GSTR-3B 3.1(a)+(b), labelled so
+        for r in F["g3"]:
+            k = (r["gstin"], r["ym"])
+            if k not in cells:
+                cells[k] = round(r["taxable"], 2); src[k] = "filed GSTR-3B 3.1(a)+(b) - no GSTR-1 in the folder"
+    gstins = sorted({k[0] for k in cells})
+    allm = sorted({k[1] for k in cells})
+    months = []
+    if allm:
+        ym = allm[0]
+        while ym <= allm[-1]:
+            months.append(ym); ym = _ym_add(ym, 1)
+    skipped = sum(int(m.group(1)) for n in F.get("out_notes", []) for m in [re.search(r"(\d+) skipped", n)] if m)
+    recon = []
+    for g in gstins:
+        for m in months:
+            a = inv.get((g, m)); b = ret.get((g, m))
+            if a is None and b is None and (g, m) not in cells:
+                continue
+            recon.append(dict(gstin=g, ym=m, source=src.get((g, m), "-"), inv=None if a is None else round(a, 2),
+                              ret=None if b is None else round(b["taxable"], 2),
+                              diff=None if a is None or b is None else round(a - b["taxable"], 2), nontax=round(nontax.get((g, m), 0), 2)))
+    # a difference with the filed return: name the document(s) of that month whose taxable value equals it
+    docs = collections.defaultdict(float)
+    for r in good:
+        if not r["nontax"]:
+            docs[(r["g"], r["ym"], r["doc"], r["no"])] += r["value"]
+    for x in recon:
+        if x["diff"] is not None and abs(x["diff"]) > 1:
+            hit = ["%s %s (%s)" % (dc, no, "{:,.2f}".format(v)) for (g, m, dc, no), v in docs.items()
+                   if g == x["gstin"] and m == x["ym"] and abs(abs(v) - abs(x["diff"])) <= 1]
+            x["why"] = ("the difference equals %s - check whether it was filed in this return" % "; ".join(hit[:5])) if hit else \
+                "no single document equals the difference - compare this month's documents with the return"
+    fixed = [r for r in good if r.get("fixed")]
+    return dict(gstins=gstins, months=months, cells=cells, recon=recon, dups=dups, invalid=invalid, skipped=skipped,
+                fixed=fixed, notes=F.get("out_notes", []), rows=good)
+
+
 def _add_gst_taxable_summary(wb, F):
-    rows_by_gstin = collections.defaultdict(dict)
-    invalid = []
-    duplicates = 0
-    for r in F.get("g1", []):
-        gstin = str(r.get("gstin") or "").strip().upper()
-        if not re.fullmatch(r"[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]", gstin):
-            invalid.append((gstin or "(blank)", r.get("ym"), r.get("arn", "")))
-            continue
-        ym = r.get("ym")
-        if not ym or not isinstance(r.get("taxable"), (int, float)):
-            invalid.append((gstin, ym, "Missing period or taxable value"))
-            continue
-        previous = rows_by_gstin[gstin].get(ym)
-        if previous is None:
-            rows_by_gstin[gstin][ym] = r
-        else:
-            # A duplicate file for this return period counts once; keep the latest ARN copy.
-            duplicates += 1
-            old_arn = d(previous.get("arn", "")) if previous.get("arn") else None
-            new_arn = d(r.get("arn", "")) if r.get("arn") else None
-            if new_arn and (not old_arn or new_arn > old_arn):
-                rows_by_gstin[gstin][ym] = r
-    months = sorted({ym for by_month in rows_by_gstin.values() for ym in by_month},
-                    key=lambda ym: (ym[0] if ym[1] >= 4 else ym[0] - 1, (ym[1] - 4) % 12))
+    S = gst_outward_summary(F)
+    Font, Fill, Al = openpyxl.styles.Font, openpyxl.styles.PatternFill, openpyxl.styles.Alignment
+    head = lambda c: (setattr(c, "font", Font(bold=True, color="FFFFFF")), setattr(c, "fill", Fill("solid", fgColor="173B38")),
+                      setattr(c, "alignment", Al(wrap_text=True, vertical="top")))
     ws = wb.create_sheet("GST Taxable Summary")
-    headers = ["GSTIN"] + [_mname(ym) + "-" + str(ym[0]) for ym in months] + ["Total"]
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
-        cell.fill = openpyxl.styles.PatternFill("solid", fgColor="173B38")
-        cell.alignment = openpyxl.styles.Alignment(wrap_text=True)
-    for gstin in sorted(rows_by_gstin):
-        values = [round(float(rows_by_gstin[gstin][ym]["taxable"]), 2) if ym in rows_by_gstin[gstin] else 0.0 for ym in months]
-        ws.append([gstin] + values + [round(sum(values), 2)])
-    grand = [round(sum(float(by_month[ym]["taxable"]) for by_month in rows_by_gstin.values() if ym in by_month), 2) for ym in months]
+    ms = S["months"]
+    ws.append(["GSTIN"] + [dt.date(y, m, 1).strftime("%b-%Y") for y, m in ms] + ["Total"])
+    for c in ws[1]: head(c)
+    for g in S["gstins"]:
+        vals = [S["cells"].get((g, m), 0.0) for m in ms]
+        ws.append([g] + vals + [round(sum(vals), 2)])
+    grand = [round(sum(S["cells"].get((g, m), 0.0) for g in S["gstins"]), 2) for m in ms]
     ws.append(["Grand Total"] + grand + [round(sum(grand), 2)])
-    for cell in ws[ws.max_row]:
-        cell.font = openpyxl.styles.Font(bold=True, color="173B38")
-        cell.fill = openpyxl.styles.PatternFill("solid", fgColor="EAF4F1")
-    ws.freeze_panes = "B2"
-    ws.auto_filter.ref = ws.dimensions
-    for col in ws.columns:
-        width = min(22, max(14, max(len(str(cell.value or "")) for cell in col) + 2))
-        ws.column_dimensions[col[0].column_letter].width = width
+    for c in ws[ws.max_row]:
+        c.font = Font(bold=True)
     for row in ws.iter_rows(min_row=2, min_col=2):
-        for cell in row:
-            cell.number_format = "#,##0.00"
-    ws.append(["Basis: filed GSTR-1 taxable value by return tax period. Reported debit/credit notes and amendments are included in each filed-period net amount; tax columns are excluded."])
-    ws.cell(ws.max_row, 1).font = openpyxl.styles.Font(italic=True, color="66736D")
-    ws.merge_cells(start_row=ws.max_row, start_column=1, end_row=ws.max_row, end_column=max(1, len(headers)))
-    review = wb.create_sheet("GST Summary Review")
-    review.append(["Check", "Count", "Details"])
-    review.append(["Duplicate GSTIN-period return skipped", duplicates, "Each return period is included once; latest ARN copy retained when available."])
-    review.append(["Invalid or incomplete GSTR-1 return", len(invalid), "; ".join("%s %s %s" % item for item in invalid)[:30000]])
-    for cell in review[1]:
-        cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
-        cell.fill = openpyxl.styles.PatternFill("solid", fgColor="173B38")
-    review.column_dimensions["A"].width = 38
-    review.column_dimensions["B"].width = 14
-    review.column_dimensions["C"].width = 100
-    review.freeze_panes = "A2"
+        for c in row:
+            c.number_format = "#,##0.00"
+    ws.column_dimensions["A"].width = 20
+    for i in range(len(ms) + 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i + 2)].width = 15
+    ws.freeze_panes = "B2"
+    ws.append([])
+    ws.append(["Rows skipped: %d (invalid / blank GSTIN: %d; blank or non-numeric taxable value: %d). Duplicate rows counted once: %d. "
+               "Date range: %s to %s." % (len(S["invalid"]) + S["skipped"], len(S["invalid"]), S["skipped"], S["dups"],
+                                          dt.date(*ms[0], 1).strftime("%b-%Y") if ms else "-", dt.date(*ms[-1], 1).strftime("%b-%Y") if ms else "-")])
+    ws.append(["Taxable value only (tax and invoice-value columns not used). Month = invoice / note date; credit notes minus, debit notes plus. "
+               "A month with no invoice-level file is taken from the filed GSTR-1 of that tax period - see 'GST Summary Review'."])
+    # ---- review: source of every month, reconciliation with the filed GSTR-1, every correction and exclusion ----
+    rv = wb.create_sheet("GST Summary Review")
+    rv.append(["GSTIN", "Month", "Figure taken from", "Invoice-level total", "Filed GSTR-1 (same tax period)", "Difference", "Check",
+               "Nil / exempt / non-GST (not included)"])
+    for c in rv[1]: head(c)
+    for r in S["recon"]:
+        chk = "Ties with the filed GSTR-1" if r["diff"] is not None and abs(r["diff"]) <= 1 else \
+            ("DIFFERS from the filed GSTR-1: " + r.get("why", "") if r["diff"] is not None else
+             ("No invoice-level file - figure is the " + r["source"] if r["inv"] is None else "No GSTR-1 for this period to compare"))
+        rv.append([r["gstin"], dt.date(*r["ym"], 1).strftime("%b-%Y"), r["source"], r["inv"], r["ret"], r["diff"], chk, r["nontax"] or None])
+        if r["diff"] is not None and abs(r["diff"]) > 1:
+            for c in rv[rv.max_row]:
+                c.fill = Fill("solid", fgColor="FCE4D6")
+    for row in rv.iter_rows(min_row=2, min_col=4, max_col=8):
+        for c in row:
+            if isinstance(c.value, (int, float)):
+                c.number_format = "#,##0.00"
+    rv.append([])
+    rv.append(["Files and sheets read"]); rv.cell(rv.max_row, 1).font = Font(bold=True)
+    for n in S["notes"]:
+        rv.append([n])
+    if S["fixed"]:
+        rv.append([]); rv.append(["Dates corrected (date outside the financial year printed in the document's own number)"])
+        rv.cell(rv.max_row, 1).font = Font(bold=True)
+        for r in S["fixed"]:
+            rv.append(["%s  %s: printed %s -> %s  (%s row %d), taxable %s" % (r["doc"], r["no"], r["fixed"].strftime("%d-%m-%Y"),
+                                                                          r["day"].strftime("%d-%m-%Y"), r["src"], r["row"], "{:,.2f}".format(r["value"]))])
+    if S["invalid"]:
+        rv.append([]); rv.append(["Rows with an invalid / blank GSTIN (NOT in the summary)"]); rv.cell(rv.max_row, 1).font = Font(bold=True)
+        for r in S["invalid"][:200]:
+            rv.append(["%s | %s | %s | %s row %d" % (r["g"] or "(blank)", r["no"], "{:,.2f}".format(r["value"]), r["src"], r["row"])])
+    rv.column_dimensions["A"].width = 20; rv.column_dimensions["B"].width = 10; rv.column_dimensions["C"].width = 26
+    for c in "DEF": rv.column_dimensions[c].width = 17
+    rv.column_dimensions["G"].width = 44; rv.column_dimensions["H"].width = 18
+    rv.freeze_panes = "A2"
+    return S
 
 
 _build_excel_draft_without_taxable_summary = build_excel_draft
+
+
 def build_excel_draft(F, cfg, out):
     allc = _build_excel_draft_without_taxable_summary(F, cfg, out)
     wb = openpyxl.load_workbook(out)
     _add_gst_taxable_summary(wb, F)
     wb.save(out)
     return allc
-
-
-# Keep the required MMM-YYYY month label in the GST summary.
-_add_gst_taxable_summary_full_month = _add_gst_taxable_summary
-def _add_gst_taxable_summary(wb, F):
-    _add_gst_taxable_summary_full_month(wb, F)
-    months = sorted({r["ym"] for r in F.get("g1", []) if r.get("ym") and isinstance(r.get("taxable"), (int, float))},
-                    key=lambda ym: (ym[0] if ym[1] >= 4 else ym[0] - 1, (ym[1] - 4) % 12))
-    ws = wb["GST Taxable Summary"]
-    for col, ym in enumerate(months, 2):
-        ws.cell(1, col).value = dt.date(ym[0], ym[1], 1).strftime("%b-%Y")

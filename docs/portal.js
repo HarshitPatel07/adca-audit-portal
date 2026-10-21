@@ -10,7 +10,7 @@ async function boot() {
   try {
     py = await loadPyodide({indexURL: "https://cdn.jsdelivr.net/pyodide/v0.28.3/full/"});
     await py.loadPackage(["pymupdf", "micropip"]);
-    await py.pyimport("micropip").install(["openpyxl"]);
+    await py.pyimport("micropip").install(["openpyxl", "xlrd"]);       // xlrd: old .xls GST / sales files
     const code = await (await fetch("core.py", {cache: "no-cache"})).text();
     py.FS.writeFile("/core.py", code);
     py.FS.writeFile("/template.xlsx", new Uint8Array(await (await fetch("template.xlsx", {cache: "no-cache"})).arrayBuffer()));
