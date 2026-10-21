@@ -49,6 +49,7 @@ async function readDocs() {
     await new Promise(r => setTimeout(r, 30));
     let s = JSON.parse(py.globals.get("core").browser_scan("/work"));
     s = await runOCR(s);
+    s = await runAI(s);
     showReview(s);
     status("Read. Check the details below, then Generate Excel.");
   } catch (e) { status("Error while reading: " + e, true); console.error(e); }
@@ -107,7 +108,59 @@ async function runOCR(s) {
   return s;
 }
 
+// ---- AI fallback: only files no rule / OCR could read go to Gemini, with the user's own key; core.py checks every value ----
+function b64(bytes) {
+  let s = ""; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+async function askGemini(key, model, prompt, data) {
+  const body = {contents: [{parts: [{inline_data: {mime_type: "application/pdf", data}}, {text: prompt}]}],
+                generationConfig: {responseMimeType: "application/json", temperature: 0}};
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {method: "POST", headers: {"Content-Type": "application/json", "x-goog-api-key": key}, body: JSON.stringify(body)});
+    if (r.status === 429 || r.status >= 500) { await new Promise(res => setTimeout(res, 4000 * (attempt + 1))); continue; }
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
+    return ((j.candidates || [])[0]?.content?.parts || []).map(p => p.text || "").join("");
+  }
+  throw new Error("Gemini busy (rate limit) - try again in a minute");
+}
+
+async function runAI(s) {
+  const key = $("aiKey").value.trim(), model = $("aiModel").value;
+  try { localStorage.setItem("aiKey", key); localStorage.setItem("aiModel", model); } catch (e) {}
+  if (!key) return s;
+  const core = py.globals.get("core");
+  const cand = JSON.parse(core.ai_candidates());
+  let done = 0, failed = [];
+  const queue = cand.files.slice();
+  async function worker() {
+    while (queue.length) {
+      const f = queue.shift();
+      status(`AI reading ${++done} of ${cand.files.length}: ${f.file} ...`);
+      try {
+        const text = await askGemini(key, model, cand.prompt, b64(py.FS.readFile(f.path)));
+        s = JSON.parse(core.ai_merge(f.path, text));
+      } catch (e) { failed.push(f.file + " (" + e.message + ")"); }
+    }
+  }
+  await Promise.all([worker(), worker(), worker()]);
+  if (failed.length) status("AI could not read: " + failed.join("; "), true);
+  return s;
+}
+
+function showAI(s) {
+  const rows = s.ai || [];
+  $("aiCard").hidden = !rows.length; $("nAi").textContent = rows.length;
+  $("ai").innerHTML = "<tr><th>File (page)</th><th>Read as</th><th>Value read</th><th>Check</th></tr>" + rows.map(r =>
+    `<tr class="${r.ok ? "ocr" : "missing"}"><td>${esc(r.file)}${r.page ? " (p." + esc(r.page) + ")" : ""}</td><td>${esc(r.kind)}</td>
+     <td>${esc(r.what)}</td><td class="small">${r.ok ? "used - check against the document" + (r.why ? "; " + esc(r.why) : "") : "NOT used: " + esc(r.why)}</td></tr>`).join("");
+}
+
 function showReview(s) {
+  showAI(s);
   const banks = s.banks.map(b => `${esc(b[0])} (${b[1]} txns)`).join(", ") || '<span class="bad">none found</span>';
   $("summary").innerHTML = `Bank: ${banks}<br>GSTR-1: ${s.g1} &nbsp; GSTR-3B: ${s.g3} &nbsp; GSTIN: ${esc(s.gstins.join(", "))}<br>
     Stock statements: ${s.ss} &nbsp; Book stock: ${s.book} &nbsp; Policies: ${s.npol}<br>
@@ -203,6 +256,7 @@ function makeExcel(skipCheck) {
   } catch (e) { status("Error while making the Excel: " + e, true); console.error(e); }
 }
 
+try { $("aiKey").value = localStorage.getItem("aiKey") || ""; $("aiModel").value = localStorage.getItem("aiModel") || "gemini-flash-latest"; } catch (e) {}
 $("readBtn").onclick = readDocs;
 $("makeBtn").onclick = makeExcel;
 $("againBtn").onclick = () => { $("review").hidden = true; $("step1").hidden = false; $("folder").value = ""; $("files").value = ""; status("Ready. Pick the Working folder."); };

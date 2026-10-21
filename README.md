@@ -9,9 +9,11 @@ Tally debtor/creditor/stock files, MCA master) and download one Excel with three
 | **GST** | Month-wise outward supply, taxable value only (GSTR-1 net of credit notes vs GSTR-3B 3.1(a)), filing dates vs due dates. |
 | **Insurance** | Stock-only sum insured per policy, matched to every stock date by policy period; Fire and Burglary separate; first-loss, gaps, under-insurance flagged. |
 
-**Rules only - no AI.** Every figure comes from a fixed rule on the document. A file no rule can read is listed on the
-review page as "not read"; a scanned policy's stock SI is typed in the policy table. New bank / insurer formats are added
-as new rules in `app.py`.
+**Rules first.** Every figure comes from a fixed rule on the document where one exists. Scanned pages are read by OCR in
+the browser. Optional: paste a Gemini API key on the page - then only the PDFs no rule could read (scanned PF / ESIC /
+electricity / tax challans, stock statements, policies) are sent to Google Gemini. Every value it returns is checked by
+rules (year, payment after the wage month, bill date vs month, duplicates) and listed as "AI-read - check"; a value that
+fails a check is not used. The key is kept only in that browser - never put a key in this public repo.
 
 ## Use it (no install)
 Open **https://harshitpatel07.github.io/adca-audit-portal/** in Chrome or Edge, pick the Working folder, check the

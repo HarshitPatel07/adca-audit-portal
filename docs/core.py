@@ -189,7 +189,13 @@ def gstr3b(t):
         return None
     m = MON[yr.group(3)[:3].lower()]
     y = int(yr.group(1)) + (1 if m < 4 else 0)
-    return dict(kind="3B", gstin=g.group(1), ym=(y, m), taxable=num(a.group(1)), arn=arn.group(1) if arn else "")
+    # 3.1(b) zero rated (exports / SEZ) and 3.1(c) nil rated / exempted: the drafts' summation sales = (a) + (b) + (c)
+    # (Baid Agro, an exporter: May'25-Feb'26 = 5087.75 lakh; (a) alone is 877 lakh)
+    zb = re.search(r"\(b\) Outward taxable supplies \(zero rated\)\|([\d.,-]+)", f)
+    nc = re.search(r"\(c ?\) Other outward supplies.*?exempted\)\|([\d.,-]+)", f)
+    ta, tb, tc = num(a.group(1)), num(zb.group(1)) if zb else 0.0, num(nc.group(1)) if nc else 0.0
+    return dict(kind="3B", gstin=g.group(1), ym=(y, m), taxable=round(ta + tb, 2), sales=round(ta + tb + tc, 2),
+                arn=arn.group(1) if arn else "")
 
 
 def gstr1(t):
@@ -290,12 +296,15 @@ SKIP = ("particulars", "grand total", "closing", "opening", "debit", "balance", 
         "cin:", "monthly", "transactions")
 
 
+MONTH_WORDS = {dt.date(2000, i, 1).strftime(f).lower() for i in range(1, 13) for f in ("%B", "%b")} | {"sept"}
+
+
 def tally_names(rows):
     out = []
     for r in rows:
         n = str(r[0] or "").strip()
         if n and not any(n.lower().startswith(s) for s in SKIP) and any(isinstance(c, (int, float)) for c in r[1:]) \
-                and not re.match(r"^[\d.,-]+$", n):
+                and not re.match(r"^[\d.,-]+$", n) and n.lower() not in MONTH_WORDS:
             out.append(n)
     return out
 
@@ -335,7 +344,7 @@ def _policy_details(f, p):
     p["nature"] = m.group(1).strip() if m else p["cls"]
     # financier: known bank names after the financier / hypothecation label (several banks are joined)
     banks = []
-    for mk in re.finditer(r"Financier|Hypothecation|Bank Details|HP-|Hypo\b|Agreed Bank|Bank Clause|Interest of", f, re.I):
+    for mk in re.finditer(r"Financier|Financial Institute Name|Name of the Pledgee|Hypothecation|Bank Details|HP-|Hypo\b|Agreed Bank|Bank Clause|Interest of", f, re.I):
         seg = f[mk.start():mk.start() + 400]
         for bm in re.finditer(BANK_NAMES, seg, re.I):
             nm = re.sub(r"\s+", " ", bm.group(0)).upper().strip(" .,")
@@ -509,7 +518,10 @@ def policy_generic(f, fname):
                 found.append(("Item SI (burglary schedule)", sum(sis)))
     # 2) sum-insured table: 'Stocks' label, optional description lines, amount
     if not found:
-        for m in re.finditer(r"\|(Stocks?(?:\s*[-:][^|]{0,100})?)\|((?:[^|]{0,130}\|){0,6}?)" + AMT + r"\|", f, re.I):
+        # description lines are text only: a figure right after 'Stocks' is ITS sum insured, even 0.00 (Bajaj
+        # 'Stocks|0.00|Stock in Process|0.00|...|Plant and Machinery|1,50,00,000.00' is NOT 150 lakh of stock)
+        for m in re.finditer(r"\|(Stocks?(?:\s*[-:][^|]{0,100})?)\|((?:(?!\s*[`₹]?\s*(?:Rs\.?\s*)?[\d,]+(?:\.\d+)?\s*\|)[^|]{0,130}\|){0,6}?)"
+                             r"[`₹]?\s*(?:Rs\.?\s*)?([\d,]{5,}(?:\.\d+)?|[\d,]+\.\d\d)\|", f, re.I):
             lab, desc, v = m.group(1), m.group(2), num(m.group(3))
             # skip a 'stock in process' line and the header row of a column table (row number / 'Total sum insured' before the amount)
             if re.match(r"Stocks? in Process", lab, re.I) or re.search(r"\d{1,3}%|Upto|maximum|Total", desc, re.I) \
@@ -529,8 +541,8 @@ def policy_generic(f, fname):
     else:
         p["build"] = "Stock SI not found in this policy text - type it on the review page"
     ex = []
-    for lab in ("Building", "Plant (?:&|and) Machinery", "Furniture[^|]{0,40}", "Contents", "Electrical Installations?"):
-        m = re.search(r"\|(" + lab + r")[^|]{0,40}\|" + AMT + r"\|", f, re.I)
+    for lab in ("(?:Super Structure )?Building", "Plant (?:&|and) Machinery", "Furniture[^|]{0,40}", "Contents", "Electrical Installations?"):
+        m = re.search(r"\|(" + lab + r")[^|]{0,70}\|" + AMT + r"\|", f, re.I)
         if m and num(m.group(2)) > 0:
             ex.append("%s %.2f" % (m.group(1)[:30], num(m.group(2)) / 1e5))
             p.setdefault("items", []).append((m.group(1).strip()[:30], num(m.group(2)) / 1e5))
@@ -572,20 +584,73 @@ def tally_pdf_names(t):
     out = []
     for a, b in zip(toks, toks[1:]):
         if a and re.search(r"[A-Za-z]{2}", a) and not _pdf_amount(a) and _pdf_amount(b) and a.lower() not in HEADWORDS \
-                and not re.match(r"(page|cin|pan|e-mail|udyam|gstin|\d+-[a-z]{3}-\d+)", a.lower()):
+                and a.lower() not in MONTH_WORDS and not re.match(r"(page|cin|pan|e-mail|udyam|gstin|\d+-[a-z]{3}-\d+)", a.lower()):
             out.append(a)
+    return out
+
+
+def tally_pdf_totals(t, creditors=False):
+    """Book debtors / creditors from a Tally Sundry Debtors / Creditors PDF, as [dict(date, dr, cr)] (Rs):
+    'Group Monthly Summary' -> closing balance of every month (Baid: April 7,66,06,526.42 Dr = opening 01-05-2025);
+    'Group Summary' -> Grand Total at the period end, credit and debit columns in the printed order
+    (Clan Jul-25: Credit 2,78,89,020.19 | Debit 14,15,52,857.90 -> debtors 1136.64 lakh)."""
+    f = t.replace("\n", "|")
+    out = []
+    if re.search(r"Monthly Summary", f):
+        st = re.search(r"1-([A-Za-z]{3})-(\d{2,4}) to", f)
+        if not st:
+            return out
+        y = int(st.group(2)); y = y + 2000 if y < 100 else y; m = MON[st.group(1).lower()]
+        names = [dt.date(2000, i, 1).strftime("%B") for i in range(1, 13)]
+        for mm in re.finditer(r"(?<=\|)(" + "|".join(names) + r")\|(" + PDF_AMT + r")\s*(Cr|Dr)(?=\|)", f):
+            mi = names.index(mm.group(1)) + 1
+            while mi != m:
+                m = m % 12 + 1; y += (m == 1)
+            v = num(mm.group(2)); dr = mm.group(3) == "Dr"
+            out.append(dict(date=month_end(y, m), dr=v if dr else 0.0, cr=0.0 if dr else v))
+        return out
+    per = re.search(r"\d{1,2}-[A-Za-z]{3}-\d{2,4} to (\d{1,2}-[A-Za-z]{3}-\d{2,4})", f)
+    gt = re.search(r"G\s*r\s*a\s*n\s*d\s*T\s*o\s*t\s*a\s*l((?:\|" + PDF_AMT + r"(?:\s*(?:Dr|Cr))?){1,4})\|", f)
+    if not (per and gt and d(per.group(1))):
+        return out
+    day = d(per.group(1))
+    vals = re.findall(r"(" + PDF_AMT + r")(?:\s*(Dr|Cr))?", gt.group(1))
+    tagged = [(num(v), s) for v, s in vals if s]
+    if tagged:          # Opening | Debit | Credit | Closing: the closing is the Dr / Cr figure on the side the header
+        # prints 'Closing' (Denis text layer runs right to left: 'Closing|Transactions|Opening' -> first figure)
+        hc, ho = f.find("|Closing"), f.find("|Opening")
+        v, s = tagged[0] if hc >= 0 and (ho < 0 or hc < ho) else tagged[-1]
+        dr, cr = (v, 0.0) if s == "Dr" else (0.0, v)
+    elif len(vals) == 2:                          # two columns: Debit and Credit in the order the header prints them
+        hd = re.search(r"\|(Debit|Credit)\|(?:[^|]*\|)?(Debit|Credit)\|", f)
+        a, b = num(vals[0][0]), num(vals[1][0])
+        dr, cr = (b, a) if hd and hd.group(1) == "Credit" else (a, b)
+    elif len(vals) == 1:
+        v = num(vals[0][0])
+        dr, cr = (0.0, v) if creditors else (v, 0.0)
+    else:
+        return out
+    out.append(dict(date=day, dr=dr, cr=cr))
     return out
 
 
 def tally_pdf_stock(t):
     """Tally Stock (Group) Summary PDF: closing value of the Grand Total row, dated by the period end."""
+    r = tally_pdf_stocks(t)
+    return r[0] if r else None
+
+
+def tally_pdf_stocks(t):
+    """Every Stock Summary in the PDF: one file can hold a whole year, one report per month (Baid STOCK_25-26.pdf).
+    Each Grand Total is dated by the period printed above it."""
     f = t.replace("\n", "|")
+    out = {}
     # Tally prints 'G r a n d T o t a l'; PDF readers differ on the spacing ('G r a n d  T o t a l')
-    m = re.search(r"G\s*r\s*a\s*n\s*d\s*T\s*o\s*t\s*a\s*l\|(" + PDF_AMT + r")\|", f)
-    per = re.search(r"\d{1,2}-[A-Za-z]{3}-\d{2,4} to (\d{1,2}-[A-Za-z]{3}-\d{2,4})", f)
-    if m and per and d(per.group(1)):
-        return dict(date=d(per.group(1)), stock=round(num(m.group(1)) / 1e5, 5))
-    return None
+    for m in re.finditer(r"G\s*r\s*a\s*n\s*d\s*T\s*o\s*t\s*a\s*l\|(" + PDF_AMT + r")\|", f):
+        per = list(re.finditer(r"\d{1,2}-[A-Za-z]{3}-\d{2,4} to (\d{1,2}-[A-Za-z]{3}-\d{2,4})", f[:m.start()]))
+        if per and d(per[-1].group(1)):
+            out[d(per[-1].group(1))] = round(num(m.group(1)) / 1e5, 5)
+    return [dict(date=k, stock=v) for k, v in sorted(out.items())]
 
 
 def stock_month_table(t):
@@ -688,6 +753,20 @@ def electricity_bill(t):
     return dict(ym=(int(bm.group(2)), names.index(bm.group(1).lower()) + 1), net=num(net.group(1)) if net else None,
                 due=d(due.group(1).title()) if due else None,
                 prev_paid=d(pay.group(1).title()) if pay else None, prev_amount=num(pay.group(2)) if pay else None)
+
+
+def gst_challan(t):
+    """GST portal 'PAYMENT RECEIPT' (PMT-06 challan): CPIN, GSTIN, deposit date, total amount."""
+    f = t.replace("\n", "|")
+    if "PAYMENT RECEIPT" not in f or "CPIN" not in f:
+        return None
+    cp = re.search(r"CPIN\s*:?\|?\s*(\d{10,})", f)
+    dd = re.search(r"Deposit Date\s*:?\|?\s*(\d{2}/\d{2}/\d{4})", f)
+    am = re.search(r"Total Amount\s*\|\s*([\d,]+(?:\.\d+)?)", f)
+    g = re.search(r"GSTIN\s*:?\|?\s*(\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z])", f)
+    if not (cp and dd and am):
+        return None
+    return dict(cpin=cp.group(1), gstin=g.group(1) if g else "", paid=d(dd.group(1)), amount=num(am.group(1)))
 
 
 def mca_dins(rows):
@@ -883,7 +962,7 @@ def pick_invoices(F, kind, n=3):
 # ---------------- scan everything ----------------
 def scan(paths, log):
     F = dict(bank={}, bank_name={}, inv=[], g1=[], g3=[], ss=[], book=[], debtors=set(), creditors=set(), directors=[], policies=[], names=set(),
-             pf=[], esic=[], elec=[], dins=[], deb_tot=[], cred_tot=[])
+             pf=[], esic=[], elec=[], dins=[], deb_tot=[], cred_tot=[], challan=[], advtax=[], elec_ai=[])
     for p in paths:
         fn = os.path.basename(p); ext = fn.lower().rsplit(".", 1)[-1] if "." in fn else ""
         try:
@@ -903,14 +982,17 @@ def scan(paths, log):
                         log.append(("Stock statement", fn, "%s stock %s lakh (company format, text looks OCR'd - check)" % (r["date"], r["stock"])))
                     elif tally_pdf_kind(t):
                         k = tally_pdf_kind(t)
-                        if k == "Sundry Debtors":
-                            n = tally_pdf_names(t); F["debtors"].update(n); log.append(("Debtor ledger", fn, "%d names (PDF)" % len(n)))
-                        elif k == "Sundry Creditors":
-                            n = tally_pdf_names(t); F["creditors"].update(n); log.append(("Creditor ledger", fn, "%d names (PDF)" % len(n)))
+                        if k in ("Sundry Debtors", "Sundry Creditors"):
+                            cred = k == "Sundry Creditors"
+                            n = tally_pdf_names(t); F["creditors" if cred else "debtors"].update(n)
+                            tt = tally_pdf_totals(t, cred); F["cred_tot" if cred else "deb_tot"].extend(tt)
+                            log.append(("Creditor ledger" if cred else "Debtor ledger", fn, "%d names (PDF)%s" % (len(n), (
+                                "; closing %s" % ", ".join("%s %.2f lakh" % (x["date"].strftime("%d-%m-%Y"), (x["cr"] if cred else x["dr"] - x["cr"]) / 1e5)
+                                                           for x in tt[-3:])) if tt else "")))
                         elif k == "Stock":
-                            r = tally_pdf_stock(t)
-                            if r:
-                                F["book"].append(r); log.append(("Book stock", fn, "%s %s lakh (PDF)" % (r["date"], r["stock"])))
+                            rs = tally_pdf_stocks(t)
+                            if rs:
+                                F["book"].extend(rs); log.append(("Book stock", fn, "; ".join("%s %s lakh" % (r["date"], r["stock"]) for r in rs) + " (PDF)"))
                             else:
                                 log.append(("skipped", fn, "stock summary without a grand total"))
                         else:
@@ -927,6 +1009,12 @@ def scan(paths, log):
                         r = pf_receipt(t); F["pf"].append(r); log.append(("PF", fn, "%d-%02d Rs %s paid %s" % (r["ym"] + (r["amount"], r["paid"]))))
                     elif esic_receipt(t):
                         r = esic_receipt(t); F["esic"].append(r); log.append(("ESIC", fn, "%d-%02d Rs %s paid %s" % (r["ym"] + (r["amount"], r["paid"]))))
+                    elif gst_challan(t):
+                        r = gst_challan(t)
+                        if r["cpin"] in {x["cpin"] for x in F["challan"]}:
+                            log.append(("GST challan", fn, "CPIN %s already read from another file - counted once" % r["cpin"]))
+                        else:
+                            F["challan"].append(r); log.append(("GST challan", fn, "Rs %s deposited %s" % (r["amount"], r["paid"])))
                     elif electricity_bill(t):
                         r = electricity_bill(t); F["elec"].append(r)
                         log.append(("Electricity bill", fn, "%d-%02d net payable %s; previous month paid %s on %s" % (r["ym"] + (r["net"], r["prev_amount"], r["prev_paid"]))))
@@ -1510,7 +1598,7 @@ def draft_summation(ws, F, cfg, allc):
     inp = lambda t: start <= (t["date"].year, t["date"].month) <= base
 
     def sums(acc):
-        if acc is None:
+        if not acc or acc not in F["bank"]:
             return None, None
         tx = [t for t in dedupe(F["bank"][acc]) if inp(t)]
         dr = sum(-t["amt"] for t in tx if t["amt"] < 0)
@@ -1532,10 +1620,16 @@ def draft_summation(ws, F, cfg, allc):
     ws["B9"] = "Particulars"; ws["C9"] = "Amount (In lakhs)"
     opening = _book_total(F.get("deb_tot", []), _ym_add(start, -1))
     closing = _book_total(F.get("deb_tot", []), base)
-    g3 = {r["ym"]: r["taxable"] for r in F["g3"]} or {r["ym"]: r["taxable"] for r in F["g1"]}
-    sales = sum(g3.get(m, 0) for m in months) if all(m in g3 for m in months) else None
+    # sales = GSTR-3B 3.1 (a)+(b)+(c) per month; a month without a 3B -> GSTR-1, then the books sales register
+    g3 = {r["ym"]: r.get("sales", r["taxable"]) for r in F["g3"]}
+    g1 = {r["ym"]: r["taxable"] for r in F["g1"]}
+    bk = F.get("sales") or {}
+    vals = [g3.get(m, g1.get(m, bk.get(m))) for m in months]
+    miss = [_mlab(m) for m, v in zip(months, vals) if v is None]
+    sales = sum(v for v in vals if v is not None) if len(miss) < len(months) else None
     ws["B10"] = "Opening Debtors as on %s" % dt.date(start[0], start[1], 1).strftime("%d-%m-%Y"); ws["C10"] = _lakh(opening)
-    ws["B11"] = "Add: Sales during %s" % per; ws["C11"] = _lakh(sales)
+    ws["B11"] = "Add: Sales during %s" % per + (" (no GST return / books sales for %s)" % ", ".join(miss) if miss and sales is not None else "")
+    ws["C11"] = _lakh(sales)
     ws["B12"] = "Less: Closing Debtors as on %s" % month_end(*base).strftime("%d-%m-%Y"); ws["C12"] = _lakh(closing)
     ws["B13"] = "Sales Realization during %s" % per; ws["C13"] = "=C10+C11-C12"
     b2 = banks[1] if len(banks) > 1 else ("", None)
@@ -1590,7 +1684,9 @@ def draft_insurance(ws, F, cfg):
         if p["cls"] == "Other":
             continue
         q = pols.get(p["no"])
-        if q is None or (q["stock"] is None and p["stock"] is not None):
+        # copies of one policy number with different stock SI (Baid: schedule 0 / endorsement 1500 lakh) -> the higher
+        rank = lambda x: (x["stock"] is not None, x["stock"] or 0)
+        if q is None or rank(p) > rank(q):
             pols[p["no"]] = p
     fire = sorted((p for p in pols.values() if p["cls"] == "Fire"), key=lambda p: pdate(p["frm"]), reverse=True)
     burg = sorted((p for p in pols.values() if p["cls"] == "Burglary"), key=lambda p: pdate(p["frm"]), reverse=True)
@@ -1603,7 +1699,7 @@ def draft_insurance(ws, F, cfg):
     base = month_end(*cfg["sum_to"])
     books = {b["date"]: b["stock"] for b in F["book"] if b.get("date")}
     ss = {s["date"]: s for s in F["ss"] if s.get("date")}
-    dates = sorted(x for x in ss if x <= base)[-3:]
+    dates = sorted(x for x in set(ss) | set(books) if x <= base)[-3:]     # stock statements or books (Denis: books only)
     visit = cfg.get("visit") or max([x for x in books if x > base] or [None], key=lambda x: x or dt.date.min)
     for c, v in (("B20", "Month"), ("C20", "Total Stock"), ("D20", "Insured Amt (Fire)"), ("E20", "Insured Amt (Burglary)"), ("F20", "Remarks")):
         ws[c] = v
@@ -1692,6 +1788,16 @@ def gst_from_bank(F):
             ym = _ym_add(ym, -1) if t["date"].day <= 30 else ym
             g = res.setdefault(ym, dict(amount=0.0, paid=t["date"]))
             g["amount"] = round(g["amount"] - t["amt"], 2); g["paid"] = max(g["paid"], t["date"])
+    # GST challan receipts are the documents themselves: a period that has them is taken from them, not the bank
+    rec = {}
+    for c in F.get("challan", []):
+        if not c["paid"]:
+            continue
+        ym = (c["paid"].year, c["paid"].month)
+        ym = _ym_add(ym, -1) if c["paid"].day <= 30 else ym
+        g = rec.setdefault(ym, dict(amount=0.0, paid=c["paid"]))
+        g["amount"] = round(g["amount"] + c["amount"], 2); g["paid"] = max(g["paid"], c["paid"])
+    res.update(rec)
     return res
 
 
@@ -1729,9 +1835,26 @@ def draft_gst(ws, F, cfg):
     _due_rows(ws, F.get("esic", []), "J", 11, "ESIC", 6)
     for c, v in zip("BCDEF", ("Particulars", "Tax Period", "Amount (Rs.)", "Date Paid", "Remarks")):
         ws["%s18" % c] = v
+    # advance tax challans (latest four): due 15 Jun / 15 Sep / 15 Dec / 15 Mar of the financial year
+    for i, a in enumerate(sorted(F.get("advtax", []), key=lambda a: a["paid"], reverse=True)[:4]):
+        p = a["paid"]; q = dt.date(p.year, 6, 15) if p.month in (4, 5, 6) else dt.date(p.year, 9, 15) if p.month in (7, 8, 9) \
+            else dt.date(p.year, 12, 15) if p.month in (10, 11, 12) else dt.date(p.year, 3, 15)
+        fy = p.year if p.month >= 4 else p.year - 1
+        for c, v in zip("BCDEF", ("Advance Tax", "FY %d-%02d" % (fy, (fy + 1) % 100), a["amount"], p, "Timely Paid" if p <= q else "Lately Paid")):
+            ws["%s%d" % (c, 19 + i)] = v
     # electricity: the payment of month M is printed on the bill of month M+1 ("Last Month Payment Details")
     ws["B24"] = "Payment Details of Electricity Bill (For last 12 month):"
     bills = {b["ym"]: b for b in F.get("elec", [])}
+    ai_bills = {b["ym"]: b for b in F.get("elec_ai", [])}
+    if ai_bills and not bills:              # bills read by AI: bill date and net amount, as the drafts write them
+        last = max(ai_bills)
+        for blk, top in ((0, 25), (1, 29)):
+            ws["B%d" % top] = "Month"; ws["B%d" % (top + 1)] = "Date"; ws["B%d" % (top + 2)] = "Amount"
+            for i in range(6):
+                ym = _ym_add(last, -(blk * 6 + i)); col = "CDEFGH"[i]; b = ai_bills.get(ym)
+                ws["%s%d" % (col, top)] = _mlab(ym)
+                if b:
+                    ws["%s%d" % (col, top + 1)] = b["bill_date"]; ws["%s%d" % (col, top + 2)] = b["amount"]
     if bills:
         last = max(bills)
         for blk, top in ((0, 25), (1, 29)):
@@ -1796,9 +1919,18 @@ def build_excel_draft(F, cfg, out):
 
 
 def default_period(F):
-    """Summation period: six months ending at the latest stock-statement month (the drawing-power base)."""
+    """Summation period: six months ending at the latest stock month (stock statement or books - the drawing-power base)
+    that the bank statements cover. A stock date outside the statements (Denis: only Mar'25 read, bank Sep'25-Aug'26)
+    would give a period with no bank rows, so the bank's last month is used then."""
+    bank = [t["date"] for tx in F["bank"].values() for t in tx]
     ss = [s["date"] for s in F["ss"] if s.get("date")]
-    end = max(ss) if ss else max((t["date"] for tx in F["bank"].values() for t in tx), default=dt.date.today())
+    book = [s["date"] for s in F["book"] if s.get("date")]       # books only when no stock statement fits (the
+    if bank:                                                      # latest book stock is often the visit date)
+        lo, hi = min(bank), max(bank)
+        fit = lambda xs: [x for x in xs if (lo.year, lo.month) <= (x.year, x.month) <= (hi.year, hi.month)]
+        end = max(fit(ss) or fit(book) or [hi])
+    else:
+        end = max(ss or book or [dt.date.today()])
     to = (end.year, end.month)
     return _ym_add(to, -5), to
 
@@ -1818,7 +1950,7 @@ def browser_scan(root):
 
 def browser_summary():
     F, log = _B["F"], _B["log"]
-    ocr_done = {b for a, b, c in log if a.startswith("OCR")}
+    ocr_done = {b for a, b, c in log if a.startswith("OCR") or (a == "AI" and "used" in c and "nothing" not in c)}
     unk = [(b, c) for a, b, c in log if a == "skipped" and b not in ocr_done and b.lower().rsplit(".", 1)[-1] in ("pdf", "xlsx", "xlsm", "xls", "csv")]
     unk += [(p["file"], "policy read, but stock SI not in the text layer (scanned part) - type it in the policy table")
             for p in F["policies"] if p["stock"] is None and p["cls"] != "Other"]
@@ -1831,7 +1963,7 @@ def browser_summary():
         collateral=round(F["collateral"]["value"] / 1e5, 5) if F.get("collateral") else None,
         policies=[dict(no=p["no"], cls=p["cls"], frm=p["frm"], to=p["to"], stock=p["stock"], fl=p["first_loss"], build=p["build"],
                        file=p["file"], ocr=bool(p.get("ocr"))) for p in F["policies"]],
-        invoices=_review_invoices(F), unread=unk, log=log))
+        invoices=_review_invoices(F), unread=unk, log=log, ai=F.get("ai_rows", [])), default=str)
 
 
 def _review_invoices(F):
@@ -1989,6 +2121,194 @@ def browser_make(form_json, out):
                visit=extra[0]["date"] if extra else None, visit_stock=extra[0]["stock"] if extra else None)
     build_excel_draft(F, cfg, out)
     return re.sub(r"[^\w .-]", "", cfg["borrower"] or "Borrower")[:60].strip()
+
+
+# ---------------- AI fallback (Gemini, called from the browser with the user's own key) ----------------
+# Only files that NO rule could read are sent. Every value is checked by fixed rules below (dates, year, period vs
+# payment date, totals) and shown on the check page as 'AI-read - check'; a value that fails a check is not used.
+AI_MAX_PAGES = 40
+AI_SKIP = r"balance\s*sheet|audit|3ca|3cd|itr|annual report|sanction|\bsl\b|licen[cs]e|consent|valuation|cte|cca|gpcb|pollution|checklist"
+AI_PROMPT = """You read Indian business documents for a bank stock audit. Return JSON only, no prose.
+{"doc_type": one of "gst_challan","pf_challan","esic_challan","electricity_bill","advance_tax_challan","stock_statement",
+ "insurance_policy","gstr1","gstr3b","other",
+ "entries": [one object per challan / bill / return / statement / policy in the file - a file may hold many months]}
+Entry fields (null when not printed; dates "DD-MM-YYYY"; money in rupees as plain numbers unless said otherwise):
+ page (1-based), ref (TRRN / CPIN / challan no / bill no / policy no),
+ period "YYYY-MM": PF/ESIC wage or contribution month, electricity bill month, GST return tax period,
+ amount: total paid (challans) or net bill payable (electricity),
+ paid_date: payment confirmation / deposit / realisation date (NOT the challan generation date, NOT the due date),
+ bill_date, due_date, filed_date (GST return ARN / filing date),
+ gst_a, gst_b, gst_c: GSTR-3B table 3.1 rows (a), (b), (c) taxable value; gst_taxable: GSTR-1 total taxable value,
+ stock_date and stock_lakh (total inventory / stock as on that date, Rs lakh), debtors_lakh, creditors_lakh,
+ insurer, policy_class ("Fire" / "Burglary" / "Other"), from_date, to_date, stock_si (sum insured of stocks only, rupees).
+Read every page. Copy figures and dates exactly as printed - never compute, round or guess; use null if unsure.
+Read years carefully from the full date printed (e.g. 15-09-2026), never from a reference number."""
+
+
+def ai_candidates():
+    """PDFs no rule (and no OCR rule) could read: the browser sends these to Gemini."""
+    F, log = _B["F"], _B["log"]
+    read = {b for a, b, c in log if a not in ("skipped",) and not (a == "OCR" and "no policy" in c)}
+    by_name = {}
+    for pth in _B["paths"]:
+        by_name.setdefault(os.path.basename(pth), pth)
+    want = [b for a, b, c in log if a == "skipped" and b not in read and b.lower().endswith(".pdf")
+            and not re.search(AI_SKIP, b, re.I)]
+    want += [p["file"] for p in F["policies"] if p["cls"] != "Other" and p["stock"] is None]
+    out = []
+    for fn in dict.fromkeys(want):
+        pth = by_name.get(fn)
+        if not pth:
+            continue
+        try:
+            with pymupdf.open(pth) as doc:
+                n = len(doc)
+        except Exception:
+            continue
+        if n <= AI_MAX_PAGES and os.path.getsize(pth) < 15e6:
+            out.append(dict(path=pth, file=fn, pages=n))
+    return json.dumps(dict(files=out, prompt=AI_PROMPT))
+
+
+def _ai_fy(fn):
+    """Financial year printed in a file name ('PF_25-26.pdf', 'ESIC 2026-27') -> start year, else None."""
+    m = re.search(r"(?:20)?(\d{2})\s*[-_]\s*(\d{2})(?!\d)", fn)
+    return 2000 + int(m.group(1)) if m and int(m.group(2)) == (int(m.group(1)) + 1) % 100 else None
+
+
+def _ai_date(s, fy=None):
+    """'DD-MM-YYYY' -> date. A year outside today-4..today+1 is moved into the file's financial year, else None."""
+    x = d(str(s or "").replace("/", "-").replace(".", "-"))
+    if not x:
+        return None
+    if not (dt.date.today().year - 4 <= x.year <= dt.date.today().year + 1):
+        if not fy:
+            return None
+        x = x.replace(year=fy if x.month >= 4 else fy + 1)
+    return x
+
+
+def _ai_ym(s, fy=None):
+    m = re.match(r"\s*(\d{4})-(\d{1,2})", str(s or ""))
+    if not m or not 1 <= int(m.group(2)) <= 12:
+        return None
+    y, mo = int(m.group(1)), int(m.group(2))
+    if not (dt.date.today().year - 4 <= y <= dt.date.today().year + 1):
+        if not fy:
+            return None
+        y = fy if mo >= 4 else fy + 1
+    return (y, mo)
+
+
+def _ai_money(v):
+    try:
+        v = float(str(v).replace(",", "").replace("Rs", "").strip())
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def ai_merge(path, text):
+    """Apply one Gemini answer to the data, entry by entry, after the rule checks. Returns the review summary."""
+    F, log = _B["F"], _B["log"]; fn = os.path.basename(path); fy = _ai_fy(fn)
+    rows = F.setdefault("ai_rows", [])
+    try:
+        j = json.loads(re.sub(r"^```(?:json)?|```$", "", text.strip()))
+    except Exception:
+        log.append(("AI", fn, "answer was not readable JSON - file not used")); return browser_summary()
+    kind = j.get("doc_type") or "other"; used = 0
+    def row(e, what, ok, why=""):
+        rows.append(dict(file=fn, page=e.get("page"), kind=kind, what=what, ok=ok, why=why))
+    gst = next(iter(sorted({r["gstin"] for r in F["g1"] + F["g3"]})), "")
+    for e in j.get("entries") or []:
+        amt = _ai_money(e.get("amount")); paid = _ai_date(e.get("paid_date"), fy); ym = _ai_ym(e.get("period"), fy)
+        if kind in ("pf_challan", "esic_challan"):
+            if ym is None and paid:
+                ym = _ym_add((paid.year, paid.month), -1)
+            # a wage month is paid after it ends, normally by the 15th of the next month (late up to ~3 months)
+            gap = (paid - month_end(*ym)).days if paid and ym else None
+            what = "%s %s Rs %s paid %s" % (kind[:-8].upper(), _mlab(ym) if ym else "?", amt, paid)
+            if not (amt and paid and ym) or not 0 < gap <= 105:
+                row(e, what, False, "missing figure" if gap is None else "payment date %s is not after the wage month %s" % (paid, _mlab(ym))); continue
+            lst = F["pf" if kind == "pf_challan" else "esic"]
+            if any(x["ym"] == ym and not x.get("ai") for x in lst):
+                row(e, what, False, "month already read by a rule"); continue
+            same = next((x for x in lst if x["ym"] == ym and x.get("ref") != e.get("ref")), None)
+            if same:                       # second challan of one month (arrears): added together
+                same["amount"] += amt; same["paid"] = max(same["paid"], paid); row(e, what, True, "added to the other challan of this month")
+            elif not any(x.get("ref") and x.get("ref") == e.get("ref") for x in lst):
+                lst.append(dict(kind=kind[:-8].upper(), ym=ym, amount=amt, paid=paid, ai=True, ref=e.get("ref"))); row(e, what, True)
+            used += 1
+        elif kind == "electricity_bill":
+            bd = _ai_date(e.get("bill_date"), fy)
+            ym = ym or ((bd.year, bd.month) if bd else None)
+            what = "Electricity %s bill %s Rs %s" % (_mlab(ym) if ym else "?", bd, amt)
+            if not (ym and bd and amt) or abs((bd.year * 12 + bd.month) - (ym[0] * 12 + ym[1])) > 1:
+                row(e, what, False, "bill month / date missing or do not agree"); continue
+            if not any(x["ym"] == ym for x in F["elec_ai"]):
+                F["elec_ai"].append(dict(ym=ym, bill_date=bd, amount=amt)); used += 1
+            row(e, what, True)
+        elif kind == "advance_tax_challan":
+            what = "Advance tax Rs %s paid %s" % (amt, paid)
+            if not (amt and paid):
+                row(e, what, False, "missing figure"); continue
+            if not any(x["paid"] == paid and x["amount"] == amt for x in F["advtax"]):
+                F["advtax"].append(dict(paid=paid, amount=amt)); used += 1
+            row(e, what, True)
+        elif kind == "gst_challan":
+            what = "GST challan Rs %s deposited %s" % (amt, paid)
+            ref = str(e.get("ref") or "%s-%s" % (paid, amt))
+            if not (amt and paid):
+                row(e, what, False, "missing figure"); continue
+            if ref not in {x["cpin"] for x in F["challan"]}:
+                F["challan"].append(dict(cpin=ref, gstin=gst, paid=paid, amount=amt, ai=True)); used += 1
+            row(e, what, True)
+        elif kind == "stock_statement":
+            sd = _ai_date(e.get("stock_date"), fy); st = _ai_money(e.get("stock_lakh"))
+            what = "Stock statement %s stock %s lakh" % (sd, st)
+            if not (sd and st):
+                row(e, what, False, "date or stock missing"); continue
+            if sd in {s["date"] for s in F["ss"]}:
+                row(e, what, False, "date already read by a rule"); continue
+            F["ss"].append(dict(date=sd, stock=st, creditors=_ai_money(e.get("creditors_lakh")),
+                                debtors=_ai_money(e.get("debtors_lakh")), split=None, check=True, ai=True)); used += 1
+            row(e, what, True)
+        elif kind == "insurance_policy":
+            no = re.sub(r"\s+", "", str(e.get("ref") or "")); si = _ai_money(e.get("stock_si"))
+            fr, to = _ai_date(e.get("from_date")), _ai_date(e.get("to_date"))
+            what = "Policy %s %s to %s stock SI %s" % (no, fr, to, si)
+            p = next((x for x in F["policies"] if x["file"] == fn or (no and x["no"] == no)), None)
+            if p is not None:
+                if p["stock"] is None and si is not None:
+                    p["stock"] = si / 1e5; p["ocr"] = True; p["build"] += " | AI-read stock SI %s - CHECK against the policy" % si
+                    used += 1; row(e, what, True)
+                else:
+                    row(e, what, False, "policy already read by a rule")
+                continue
+            cls = e.get("policy_class") if e.get("policy_class") in ("Fire", "Burglary", "Other") else None
+            if not (no and fr and to and cls and fr < to):
+                row(e, what, False, "policy no / period / class missing"); continue
+            F["policies"].append(dict(file=fn, no=no, frm=fr.strftime("%d/%m/%Y"), to=to.strftime("%d/%m/%Y"), insured="", gstin="",
+                                      prev="", insurer=e.get("insurer") or "", first_loss=None, stock=si / 1e5 if si else None,
+                                      build="AI-read - CHECK against the policy", excluded="", sub=None, cls=cls, ocr=True,
+                                      items=[("Stock", si / 1e5)] if si else []))
+            used += 1; row(e, what, True)
+        elif kind in ("gstr3b", "gstr1"):
+            k = "g3" if kind == "gstr3b" else "g1"
+            vals = [_ai_money(e.get(x)) or 0.0 for x in (("gst_a", "gst_b", "gst_c") if k == "g3" else ("gst_taxable",))]
+            fd = _ai_date(e.get("filed_date"), fy)
+            what = "%s %s taxable %s filed %s" % (kind.upper(), _mlab(ym) if ym else "?", sum(vals), fd)
+            if not ym or not any(vals):
+                row(e, what, False, "period or value missing"); continue
+            if any(r["ym"] == ym for r in F[k]):
+                row(e, what, False, "period already read by a rule"); continue
+            r = dict(kind="3B" if k == "g3" else "1", gstin=gst, ym=ym, arn=fd.strftime("%d/%m/%Y") if fd else "", ai=True)
+            r.update(taxable=round(vals[0] + vals[1], 2), sales=round(sum(vals), 2)) if k == "g3" else r.update(taxable=vals[0])
+            F[k].append(r); used += 1; row(e, what, True)
+        else:
+            row(e, "-", False, "not a document the Excel uses")
+    log.append(("AI", fn, "%s: %d value(s) used - CHECK these on the page" % (kind, used) if used else "%s: nothing used" % kind))
+    return browser_summary()
 
 
 # Month-wise GST taxable-value summary added after the existing user-format workbook is built.

@@ -9,7 +9,7 @@
 <body>
 <main>
   <h1>Stock Audit Portal <span class="sub">GST · Insurance · Summation</span></h1>
-  <p class="note">Runs fully inside your browser. Your files are <b>not uploaded</b> anywhere - they are read on this computer and the Excel is made here. Rules only, no AI. Scanned pages are read by OCR in this browser and marked for you to check.</p>
+  <p class="note">Runs inside your browser. Fixed rules read every file first, on this computer. Scanned pages are read by OCR in this browser. <b>Only if you enter a Gemini API key below</b>, the PDFs that no rule could read (scanned PF / ESIC / electricity / tax challans, stock statements, policies) are sent to Google Gemini; every value it returns is checked by rules and marked "AI-read - check".</p>
   <p id="status" class="status">Loading the reader (first time about 30 seconds)...</p>
 
   <section class="card" id="step1">
@@ -17,6 +17,10 @@
     <label>Whole folder</label><input type="file" id="folder" webkitdirectory multiple>
     <label>- or individual files</label><input type="file" id="files" multiple>
     <p class="small">Used: PDF, TXT, XLSX, XLS, CSV (photos skipped). Bank statements, GSTR-1/3B, insurance policies, stock statements, Tally debtors/creditors/stock, MCA master.</p>
+    <label>Gemini API key (optional - kept only in this browser; blank = rules and OCR only, nothing leaves this computer)</label>
+    <div class="two"><input type="password" id="aiKey" placeholder="paste key from aistudio.google.com" autocomplete="off">
+      <select id="aiModel"><option value="gemini-flash-latest">Gemini Flash (fast)</option>
+        <option value="gemini-3.1-pro-preview">Gemini Pro (slower, most careful)</option></select></div>
     <button id="readBtn" disabled>Read documents</button>
   </section>
 
@@ -25,6 +29,9 @@
     <section class="card" id="unreadCard" hidden><h2>Not read by any rule (<span id="nUnread"></span>)</h2>
       <p class="small">If any of these is a bank statement, GST return, policy or stock statement, its figures are NOT in the Excel. Send that file format to be added as a rule, or type a policy's stock SI below.</p>
       <div class="wrap"><table id="unread"></table></div></section>
+    <section class="card" id="aiCard" hidden><h2>Read by AI - check each line against the document (<span id="nAi"></span>)</h2>
+      <p class="small">Green = passed the rule checks and is used in the Excel. Red = failed a check (wrong year, payment before the month ended, missing figure) and is NOT used.</p>
+      <div class="wrap"><table id="ai"></table></div></section>
     <section class="card"><h2>2. Check before generating</h2>
       <label>Borrower name(s) - own-name credits = self transfer (one per line)</label><textarea id="own"></textarea>
       <label>Borrower GSTIN</label><input type="text" id="gstin">
