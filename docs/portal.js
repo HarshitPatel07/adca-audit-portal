@@ -274,7 +274,7 @@ function makeExcel(skipCheck) {
     inv[r.dataset.id] = e;
   });
   const form = {own: $("own").value, gstin: $("gstin").value, related: $("related").value, extra: $("extra").value, pol, inv,
-                banks: $("banks").value, from: $("from").value, to: $("to").value, pm: $("pm").value, coll: $("coll").value};
+                banks: $("banks").value, fac: $("fac").value, annual: $("annual").value, from: $("from").value, to: $("to").value, pm: $("pm").value, coll: $("coll").value};
   try {
     status("Making the Excel...");
     const name = py.globals.get("core").browser_make(JSON.stringify(form), "/out.xlsx");

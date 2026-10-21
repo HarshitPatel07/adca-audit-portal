@@ -444,8 +444,40 @@ def stock_statement(t):
     # category split as printed (Rs lakh) - compared with the fire policy's RM / WIP / FG sub-limits
     split = dict(RM=part(r"1\. Total Raw Material"), WIP=part(r"2\. Stock in process"),
                  Stores=part(r"3\. Stores & Spares"), FG=part(r"4\. Finished Goods"))
+    # book-debt ageing (Annexure IV): 'A:Particulars|0-90|90+|Total value| ... SUB-TOTAL(A)|808.856|0.000|808.856'
+    ag = re.search(r"0-90\|90\+\|.*?SUB-TOTAL\(A\)\|([\d.,]+)\|([\d.,]+)\|([\d.,]+)", f)
+    asc = re.search(r"Due from\|?Associates.*?\|([\d.,]+)\|([\d.,]+)\|([\d.,]+)", f) if ag else None
     return dict(date=d(m.group(1)), stock=num(s.group(1)), creditors=num(c.group(1)) if c else None,
-                debtors=num(b.group(1)) if b else None, split=split if any(v is not None for v in split.values()) else None)
+                debtors=num(b.group(1)) if b else None, split=split if any(v is not None for v in split.values()) else None,
+                lt90=num(ag.group(1)) if ag else None, gt90=num(ag.group(2)) if ag else None,
+                assoc=num(asc.group(1)) if asc else None)
+
+
+def ageing_rows(rows, head):
+    """Debtors ageing sheet with '<90' and '>90' columns (Gold Star 'Agewise Debtors 30-6-26.xlsx', Sheet1): totals (Rs)
+    from the last row that carries both columns; dated by the Tally period end. Party rows kept for the >=5% list."""
+    for i, r in enumerate(rows[:40]):
+        low = [str(c or "").replace(" ", "").lower() for c in r]
+        if "<90" in low and ">90" in low:
+            a, b = low.index("<90"), low.index(">90")
+            name_rows, tot = [], None
+            for rr in rows[i + 1:]:
+                if len(rr) <= b:
+                    nums = [c for c in rr if isinstance(c, (int, float))]
+                    if len(nums) == 2 and not any(isinstance(c, str) and c.strip() for c in rr):
+                        tot = (float(nums[0]), float(nums[1]))       # totals line printed under the two columns
+                    continue
+                if isinstance(rr[a], (int, float)) and isinstance(rr[b], (int, float)):
+                    if isinstance(rr[0], str) and rr[0].strip():
+                        name_rows.append((rr[0].strip(), float(rr[a]), float(rr[b])))
+                    elif not any(isinstance(c, str) and c.strip() for c in rr):
+                        tot = (float(rr[a]), float(rr[b]))
+            if tot is None and name_rows:
+                lt = [rr for rr in rows[i + 1:] if len(rr) > b and isinstance(rr[a], (int, float))]
+                tot = (sum(float(x[a]) for x in lt), sum(float(x[b]) for x in lt))
+            if tot:
+                return dict(date=tally_end(head), lt90=tot[0], gt90=tot[1], parties=name_rows)
+    return None
 
 
 def tally_kind(rows):
@@ -481,6 +513,23 @@ def tally_sales(rows, head):
             if nums:
                 out[(y, m)] = round(cr - dr, 2)
     return out or None
+
+
+def tally_purchase(rows, head):
+    """Tally 'Purchase Accounts' group summary of ONE month ('1-Oct-25 to 31-Oct-25'): {(y, m): Grand Total Rs}
+    (Gold Star Oct-25 18,147,329.12 = the draft's purchase column)."""
+    if "Purchase Accounts" not in head:
+        return None
+    m = re.search(r"\b1-([A-Za-z]{3})-(\d{2,4}) to (\d{1,2}-[A-Za-z]{3}-\d{2,4})", head)
+    end = d(m.group(3)) if m else None
+    if not end or MON.get(m.group(1).lower()) != end.month:
+        return None
+    for r in rows:
+        if r and str(r[0] or "").strip() == "Grand Total":
+            v = [c for c in r[1:] if isinstance(c, (int, float))]
+            if v:
+                return {(end.year, end.month): float(v[0])}
+    return None
 
 
 def tally_end(head):
@@ -1357,7 +1406,7 @@ def scan(paths, log):
                     # (big sales registers / GST Excel downloads took 40-85 s each to read in full)
                     top = xlsx_rows(p, 200)
                     k0, h0 = tally_kind(top)
-                    if not (k0 or tally_sales(top, h0) or mca_directors(top) or bank_table(top)[1]):
+                    if not (k0 or tally_sales(top, h0) or tally_purchase(top, h0) or mca_directors(top) or bank_table(top)[1]):
                         log.append(("skipped", fn, "not recognised")); continue
                     rows = xlsx_rows(p)
                 k, head = tally_kind(rows)
@@ -1368,10 +1417,17 @@ def scan(paths, log):
                     F["debtors"].update(tally_names(rows)); log.append(("Debtor ledger", fn, "names read"))
                     tt = tally_group_total(rows, head)
                     if tt and tt["date"]: F["deb_tot"].append(tt)
+                    ag = ageing_rows(rows, head)
+                    if ag and ag["date"]:
+                        F.setdefault("ageing", []).append(ag)
+                        log.append(("Debtor ageing", fn, "%s: <90 %.2f lakh, >90 %.2f lakh" % (ag["date"], ag["lt90"] / 1e5, ag["gt90"] / 1e5)))
                 elif k == "Sundry Creditors":
                     F["creditors"].update(tally_names(rows)); log.append(("Creditor ledger", fn, "names read"))
                     tt = tally_group_total(rows, head)
                     if tt and tt["date"]: F["cred_tot"].append(tt)
+                elif tally_purchase(rows, head):
+                    r = tally_purchase(rows, head); F.setdefault("purch", {}).update(r)
+                    log.append(("Books purchase", fn, "; ".join("%d-%02d %s" % (k + ("{:,.2f}".format(v),)) for k, v in r.items())))
                 elif tally_sales(rows, head):
                     r = tally_sales(rows, head); F.setdefault("sales", {}).update(r)
                     log.append(("Books sales", fn, "%d months (sales net of returns)" % len(r)))
@@ -2254,6 +2310,355 @@ def draft_invoice(ws, F, cfg):
                                      if pick_invoices(F, kind) else "No %s invoice found in the documents" % kind)
 
 
+# ================= the firm's other five sheets (Gold Star draft layout): Facility, DP, Stock / Debtors / Creditors =================
+def _at(rows, day, key=None, creditors=False):
+    """Book debtors / creditors (Rs) on an exact date, else at that month's end."""
+    for want in (day, month_end(day.year, day.month)):
+        for r in rows:
+            if r["date"] == want:
+                return r["cr"] if creditors else r["dr"] - r["cr"]
+    return None
+
+
+def _bal_on(F, acc, day):
+    """CC outstanding (Rs, positive) on a day: the balance after the last transaction on or before it."""
+    tx = [t for t in dedupe(F["bank"].get(acc, [])) if t["date"] <= day and t.get("bal") is not None]
+    return abs(tx[-1]["bal"]) if tx else None
+
+
+def fw_ctx(F, cfg):
+    """Everything the five sheets need, from the documents (lakh = Rs / 1e5). None = no source -> blank cell."""
+    base = month_end(*cfg["sum_to"])
+    books = {}
+    for b in F["book"]:
+        if b.get("date"):
+            books[b["date"]] = max(books.get(b["date"], 0), b["stock"])
+    ss = {s["date"]: s for s in F["ss"] if s.get("date")}
+    ages = {a["date"]: a for a in F.get("ageing", [])}
+    visit = cfg.get("visit") or max([x for x in books if x > base] or [None], key=lambda x: x or dt.date.min)
+    # stock dates of the holding tables: as the Insurance rows (month before the period .. period end)
+    lo = _ym_add(cfg["sum_from"], -1)
+    inwin = lambda xs: sorted(x for x in xs if lo <= (x.year, x.month) and x <= base)
+    dates = inwin(books) or inwin(ss)
+    step = 1
+    if len(dates) > 1:
+        gaps = [(b.year * 12 + b.month) - (a.year * 12 + a.month) for a, b in zip(dates, dates[1:])]
+        step = max(1, min(gaps))
+    accs = sorted(F["bank"].items(), key=lambda kv: -len(kv[1]))
+    cc = next((a for a, tx in accs if _is_cc(dedupe(tx))), accs[0][0] if accs else None)
+    rel = [n for n in cfg.get("related", []) if n and n not in F.get("directors", [])]
+    def assoc(day):                      # related parties' balances in the ageing of that day (lt90, gt90 rows)
+        a = ages.get(day)
+        if not a:
+            return None, []
+        hits = [(n, lt, gt) for n, lt, gt in a["parties"] if any(name_hit(r, n) for r in rel)]
+        return sum(h[1] for h in hits), hits
+    return dict(base=base, visit=visit, books=books, ss=ss, ages=ages, dates=dates, step=step, cc=cc,
+                assoc=assoc, L=lambda v: None if v is None else v / 1e5)
+
+
+def fw_facility(ws, F, cfg, X):
+    banks = cfg.get("banks") or []
+    b1 = banks[0] if banks else ("", None)
+    bank1 = (b1[0] or (F.get("bank_name") or {}).get(X["cc"]) or "Bank").upper()
+    bn = X["base"].strftime("%d-%m-%Y"); vn = X["visit"].strftime("%d-%m-%Y") if X["visit"] else ""
+    ws["A2"], ws["B2"], ws["C2"], ws["E2"] = "Particulars", "Limits Sanctioned", "As on " + bn, ("As on " + vn) if vn else None
+    ws["C3"], ws["D3"], ws["E3"], ws["F3"] = "DP", bank1, "DP", bank1
+    ws["A4"], ws["B4"] = "Cash Credit", b1[1]
+    ws["C4"], ws["E4"] = "='DP calculation'!D21", "='DP calculation'!E21"
+    ws["D4"] = X["L"](_bal_on(F, X["cc"], X["base"])) if X["cc"] else None
+    ws["F4"] = X["L"](_bal_on(F, X["cc"], X["visit"])) if X["cc"] and X["visit"] else None
+    extra = cfg.get("facilities") or []           # typed: name, limit, o/s on base date, o/s on visit date
+    for i, f in enumerate(extra[:1]):
+        ws["A5"], ws["B5"], ws["C5"], ws["D5"], ws["E5"], ws["F5"] = f[0], f[1], "NA", f[2], "NA", f[3]
+    ws["A6"] = "Total Exposure"
+    for c in "BCDEF":
+        ws[c + "6"] = "=SUM(%s4:%s5)" % (c, c)
+    b2 = banks[1] if len(banks) > 1 else None
+    ws["A10"], ws["B10"] = "Particulars(%s)" % (_short_bank(b2[0]) + " bank" if b2 else "other bank"), "Limits Sanctioned"
+    if b2:
+        ws["A12"], ws["B12"] = (b2[2] if len(b2) > 2 and b2[2] else "Fund based limit"), b2[1]
+
+
+def fw_dp(ws, F, cfg, X):
+    L, base, v = X["L"], X["base"], X["visit"]
+    bn = base.strftime("%d-%m-%Y"); vn = v.strftime("%d-%m-%Y") if v else ""
+    banks = cfg.get("banks") or []
+    s1 = _short_bank((banks[0][0] if banks else "") or (F.get("bank_name") or {}).get(X["cc"]) or "Bank")
+    s2 = _short_bank(banks[1][0]) if len(banks) > 1 else "other"
+    ws["E1"] = "(Amt in Lacs)"
+    ws["B2"], ws["C2"], ws["D2"] = "Particulars", "As on %s as per Stock Statement" % bn, "As on %s as per Books of Accounts" % bn
+    ws["E2"] = ("As on " + vn) if v else None
+    labels = ["Total Stock", "Less: Sundry Creditors", "Value of Paid Stock", "Less: Margin @ 25%", "DP on Stock (A)",
+              "Total Receivable ", "Receivables <90 days", "Less: Due from Associates/Affiliated/Subsidiaries",
+              "Receivables < 90 days (Net)", "Less: Margin @ 25% ", "DP on Receivables (B)",
+              "Receivables > 90 days (above Cover Period) (Net)", "Total DP (Stock + Receivables) (A+B)",
+              "Limit Sanctioned (%s bank)" % s1, "Limit Sanctioned (%s bank)" % s2, "Total Limit Sanctioned",
+              "Proportionate DP for %s Bank Ltd." % s1, "Proportionate DP for %s Bank Ltd." % s2, "Eligible DP",
+              "Limit Utilised (FB)", "Excess Utilisation (FB) if any", "Remark For %s Bank" % s1]
+    for i, t in enumerate(labels):
+        ws.cell(3 + i, 2, t)
+    s = X["ss"].get(base) or {}
+    ab = X["ages"].get(base); av = X["ages"].get(v) if v else None
+    asb, hb = X["assoc"](base); asv, hv = X["assoc"](v) if v else (None, [])
+    col = {"C": dict(stock=s.get("stock"), cred=s.get("creditors"), deb=s.get("debtors"), lt=s.get("lt90"), assoc=s.get("assoc")),
+           "D": dict(stock=X["books"].get(base), cred=L(_at(F["cred_tot"], base, creditors=True)), deb=L(_at(F["deb_tot"], base)),
+                     lt=L(ab["lt90"]) if ab else None, assoc=L(asb) if ab else None)}
+    if v:
+        col["E"] = dict(stock=X["books"].get(v), cred=L(_at(F["cred_tot"], v, creditors=True)), deb=L(_at(F["deb_tot"], v)),
+                        lt=L(av["lt90"]) if av else None, assoc=L(asv) if av else None)
+    for c, x in col.items():
+        ws[c + "3"], ws[c + "4"], ws[c + "8"], ws[c + "9"], ws[c + "10"] = x["stock"], x["cred"], x["deb"], x["lt"], x["assoc"] or 0
+        ws[c + "5"] = "=%s3-%s4" % (c, c); ws[c + "6"] = "=%s5*25%%" % c; ws[c + "7"] = "=%s5-%s6" % (c, c)
+        ws[c + "11"] = "=%s9-%s10" % (c, c); ws[c + "12"] = "=%s11*25%%" % c; ws[c + "13"] = "=%s11-%s12" % (c, c)
+        ws[c + "14"] = "=%s8-%s9" % (c, c); ws[c + "15"] = "=%s7+%s13" % (c, c)
+        ws[c + "16"] = "='Facility sanctioned'!B4"; ws[c + "17"] = "='Facility sanctioned'!B12"; ws[c + "18"] = "=%s16+%s17" % (c, c)
+        ws[c + "19"] = "=%s15*%s16/%s18" % (c, c, c); ws[c + "20"] = "=%s15*%s17/%s18" % (c, c, c)
+        ws[c + "21"] = "=+MIN(%s16,%s19)" % (c, c)
+        ws[c + "22"] = "='Facility sanctioned'!$D$4" if c != "E" else "='Facility sanctioned'!F4"
+        ws[c + "23"] = "=IF(N(%s22)>%s21,%s22-%s21,0)" % (c, c, c, c)
+        ws[c + "24"] = '=IF(N(%s22)>%s21,IF(%s22<=%s16,"Over Utilised against DP but within the sanction limit","Over Utilised beyond the sanction limit"),"Regular")' % (c, c, c, c)
+    ws["B26"], ws["C26"], ws["D26"], ws["E26"] = "Debtors as on", "< 90 Days", "> 90 Days", "Total"
+    rowsd = [("As on %s (As per Stock SS)" % bn, "C"), ("As on %s (As per Books)" % bn, "D")] + \
+            ([("As on Visit Date %s (As per Books)" % vn, "E")] if v else [])
+    ws["B31"], ws["C31"] = "Creditors as on", "Total"
+    for k, (lab, c) in enumerate(rowsd):
+        r = 27 + k
+        ws.cell(r, 2, lab); ws.cell(r, 3, "=%s9" % c); ws.cell(r, 4, "=%s14" % c); ws.cell(r, 5, "=C%d+D%d" % (r, r))
+        ws.cell(32 + k, 2, "=B%d" % r); ws.cell(32 + k, 3, "=%s4" % c)
+    ws["B38"], ws["C38"], ws["D38"], ws["E38"] = "Debtors", "As per Stock statement", "As per Books of Account", "Variance"
+    ws["B39"], ws["C39"], ws["D39"], ws["E39"], ws["F39"] = base, "=C8", "=D8", "=F39/C39", "=C39-D39"
+    # sister concerns (related parties in the debtors ageing): below / above 90 days on both dates
+    ws["B41"], ws["C41"], ws["E41"] = "Sister Concern Name", "As on " + bn, ("As on " + vn) if v else None
+    ws["C42"], ws["D42"], ws["E42"], ws["F42"] = "Below 90 days", "Above 90 days", "Below 90 days", "Above 90 days"
+    names = list(dict.fromkeys([h[0] for h in hb] + [h[0] for h in hv]))
+    for k, n in enumerate(names[:2]):
+        r = 43 + k
+        b_ = next((h for h in hb if h[0] == n), None); v_ = next((h for h in hv if h[0] == n), None)
+        ws.cell(r, 2, re.sub(r"\s*\((?:Sales|Purchase|Purchases)\)\s*$", "", n)); ws.cell(r, 3, L(b_[1]) if b_ else 0); ws.cell(r, 4, L(b_[2]) if b_ else 0)
+        ws.cell(r, 5, L(v_[1]) if v_ else 0); ws.cell(r, 6, L(v_[2]) if v_ else 0)
+    if names:
+        ws["G43"], ws["H43"] = "=C45/D8", "=E45/E8"
+    ws["B45"] = "Total"
+    for c in "CDEF":
+        ws[c + "45"] = "=%s43+%s44" % (c, c)
+    # stock statement vs books: the base date, then the stock date before it (Gold Star: Jun'26, then Mar'26)
+    prev = [x for x in X["dates"] if x < base]
+    blocks = [(47, base, None)] + ([(53, prev[-1], prev[-1])] if prev else [])
+    for top, day, other in blocks:
+        ws.cell(top, 2, _mlab((day.year, day.month)))
+        for c, t in zip("BCDE", ["Particulars", "As per stock statement", "As per book", "Variance"]):
+            ws["%s%d" % (c, top + 1)] = t
+        so = X["ss"].get(day) or {}
+        vals = [(so.get("stock"), X["books"].get(day)), (so.get("debtors"), L(_at(F["deb_tot"], day))),
+                (so.get("creditors"), L(_at(F["cred_tot"], day, creditors=True)))]
+        for k, (lab, rr) in enumerate((("Stock", 3), ("Debtors", 8), ("Creditors", 4))):
+            r = top + 2 + k
+            ws.cell(r, 2, lab)
+            if other is None:
+                ws.cell(r, 3, "=C%d" % rr); ws.cell(r, 4, "=D%d" % rr)
+            else:
+                ws.cell(r, 3, vals[k][0]); ws.cell(r, 4, vals[k][1])
+            ws.cell(r, 5, '=IFERROR(F%d/C%d,"")' % (r, r)); ws.cell(r, 6, "=C%d-D%d" % (r, r))
+        r = top + 5
+        ws.cell(r, 3, "=SUM(C%d:C%d)" % (top + 2, top + 4)); ws.cell(r, 4, "=SUM(D%d:D%d)" % (top + 2, top + 4))
+        ws.cell(r, 5, '=IFERROR(F%d/C%d,"")' % (r, r)); ws.cell(r, 6, "=C%d-D%d" % (r, r))
+
+
+def _grow(ws, at, k):
+    """Insert k rows before row `at`, moving the template's merged ranges below it too (openpyxl does not)."""
+    if k <= 0:
+        return
+    below = [m for m in list(ws.merged_cells.ranges) if m.min_row >= at]
+    for m in below:
+        ws.unmerge_cells(str(m))
+    ws.insert_rows(at, k)
+    for m in below:
+        ws.merge_cells(start_row=m.min_row + k, start_column=m.min_col, end_row=m.max_row + k, end_column=m.max_col)
+
+
+def fw_periods(F, X):
+    """Holding-table periods: each stock date with the months it covers (Gold Star quarterly: Dec'25 = Oct-Dec)."""
+    out = []
+    for i, day in enumerate(X["dates"]):
+        ym = (day.year, day.month)
+        ms = [_ym_add(ym, -j) for j in range(X["step"] - 1, -1, -1)]
+        out.append(dict(day=day, ym=ym, months=ms, days=30 * X["step"] * (i + 1)))
+    return out
+
+
+# Month-wise detail kept here for the holding formulas: GSTR-3B sales (a)+(b)+(c) and book purchases, in Rs
+def _sales_m(F, ym):
+    g3 = {r["ym"]: r.get("sales", r["taxable"]) for r in F["g3"]}
+    g1 = {r["ym"]: r["taxable"] for r in F["g1"]}
+    return g3.get(ym, g1.get(ym))
+
+
+def fw_stock(ws, F, cfg, X, P):
+    n = len(P); o = max(0, n - 3)
+    _grow(ws, 6, o)
+    ws["A1"] = " " * 173 + "(amt in lacs)"
+    for c, t in zip("ABCDEFIJKLMNOP", ["Month", "Purchase", "Total Stock", "Sales", "Cumulative Sales", "Holding period",
+                                       "Sale as per book ", "Sale as per Gstr", "Difference", "GST 2B", "Purchase", "Stock", "Debtors", "Creditors"]):
+        ws[c + "2"] = t
+    months = [m for p in P for m in p["months"]]
+    r0 = 7 + o                                           # month-wise detail (L: month, M: GSTR-3B sales, N: purchases, Rs)
+    ws["M%d" % (r0 - 1)], ws["N%d" % (r0 - 1)] = "Gstr-3B", "Purchase"
+    for k, ym in enumerate(months):
+        ws["L%d" % (r0 + k)] = _mlab(ym); ws["M%d" % (r0 + k)] = _sales_m(F, ym); ws["N%d" % (r0 + k)] = (F.get("purch") or {}).get(ym)
+    bs = F.get("sales") or {}
+    k = 0
+    for i, p in enumerate(P):
+        r, a, b = 3 + i, r0 + k, r0 + k + len(p["months"]) - 1; k += len(p["months"])
+        ws["A%d" % r] = _mlab(p["ym"])
+        ws["B%d" % r] = "=(SUM(N%d:N%d))/100000" % (a, b)
+        ws["C%d" % r] = X["books"].get(p["day"], (X["ss"].get(p["day"]) or {}).get("stock"))
+        ws["D%d" % r] = "=(J%d)/100000" % r
+        ws["E%d" % r] = "=D%d" % r if i == 0 else "=E%d+D%d" % (r - 1, r)
+        ws["F%d" % r] = "=C%d/E%d*G%d" % (r, r, r); ws["G%d" % r] = p["days"]; ws["H%d" % r] = "=A%d" % r
+        ws["I%d" % r] = sum(bs[m] for m in p["months"]) if all(m in bs for m in p["months"]) else None
+        ws["J%d" % r] = "=SUM(M%d:M%d)" % (a, b); ws["K%d" % r] = "=I%d-J%d" % (r, r)
+    ws["A%d" % (3 + n)], ws["F%d" % (3 + n)] = "Average", "=AVERAGE(F3:F%d)" % (2 + n)
+    fy = X["base"].year - 1 if X["base"].month >= 4 else X["base"].year - 2          # last audited year end (31-03-fy)
+    R = lambda r: r + o
+    ws["A%d" % R(9)], ws["B%d" % R(9)], ws["C%d" % R(9)], ws["D%d" % R(9)] = "Period", "Total", "Sales", "Holding Days"
+    an = cfg.get("annual") or {}
+    ws["A%d" % R(10)], ws["D%d" % R(10)], ws["E%d" % R(10)] = "F.Y. %d-%02d" % (fy - 1, fy % 100), "=B%d/C%d*E%d" % (R(10), R(10), R(10)), 365
+    ws["B%d" % R(10)], ws["C%d" % R(10)], ws["B%d" % R(36)] = an.get("stock"), an.get("sales"), an.get("stock")
+    ws["R1"], ws["U1"], ws["Q2"], ws["R2"], ws["S2"] = "Books", "SS", "Stock", "Debtors", "Creditors"
+    for c, t in zip("ABCD", ["Inventory Details", "Quantity", "Rate", "Value in INR"]):
+        ws["%s%d" % (c, R(12))] = t; ws["%s%d" % (c, R(21))] = t
+    vn = X["visit"].strftime("%d-%m-%Y") if X["visit"] else ""
+    ws["A%d" % R(28)], ws["D%d" % R(28)] = "Total value of Stock physically verified on %s (Value Rs. in INR) " % vn, "=SUM(D%d:D%d)" % (R(22), R(27))
+    ws["A%d" % R(29)], ws["D%d" % R(29)] = "Total value of Stock physically verified on %s (Value Rs. in lakh)" % vn, "=(D%d)/100000" % R(28)
+    ws["A%d" % R(30)], ws["D%d" % R(30)] = "Value of opening stock of %s" % vn, "='DP calculation'!E3"
+    ws["A%d" % R(31)], ws["D%d" % R(31)] = "% of overall Stock physically verified on " + vn, "=D%d/D%d" % (R(29), R(30))
+    ye = X["ss"].get(dt.date(fy, 3, 31)) or {}
+    ws["E%d" % R(34)] = "(Amt in Lacs)"
+    for c, t in zip("ABCD", ["Inventory", "Value as per B/S as on 31-03-%d" % fy, "Value as per S/S as on 31-03-%d" % fy,
+                             "% of variance in value (only Negative variance)"]):
+        ws["%s%d" % (c, R(35))] = t
+    ws["A%d" % R(36)], ws["C%d" % R(36)] = "Total", ye.get("stock")
+    ws["D%d" % R(36)], ws["E%d" % R(36)] = "=(B%d-C%d)/C%d" % (R(36), R(36), R(36)), "=B%d-C%d" % (R(36), R(36))
+    bn = X["base"].strftime("%d-%m-%Y")
+    for top, lab, ref in ((39, "Stock Statement", "C3"), (42, "Books of Accounts", "D3")):
+        ws["A%d" % R(top)] = "Stock position as per %s as on %s" % (lab, bn)
+        ws["A%d" % R(top + 1)], ws["C%d" % R(top + 1)] = "Particular", "Values in Lakh"
+        ws["A%d" % R(top + 2)], ws["C%d" % R(top + 2)] = "Total Stock ", "='DP calculation'!%s" % ref
+    st = dt.date(cfg["sum_from"][0], cfg["sum_from"][1], 1).strftime("%d-%m-%Y")
+    last = 2 + n
+    ws["A%d" % R(47)], ws["B%d" % R(47)] = "Particulars", "Total"
+    ws["A%d" % R(48)], ws["B%d" % R(48)] = "Opening stock as on " + st, "=C3"
+    ws["A%d" % R(49)], ws["B%d" % R(49)] = "Add: Purchases Total During %s to %s" % (st, bn), "=SUM(B4:B%d)" % last
+    ws["A%d" % R(50)], ws["B%d" % R(50)] = "Total", "=B%d+B%d" % (R(48), R(49))
+    ws["A%d" % R(51)], ws["B%d" % R(51)] = "Less: Closing Stock as on " + bn, "=C%d" % last
+    ws["A%d" % R(52)], ws["B%d" % R(52)] = "Consumption", "=B%d-B%d" % (R(50), R(51))
+    ws["A%d" % R(53)], ws["B%d" % R(53)] = "Sales-Actual", "=E%d" % last
+    ws["A%d" % R(55)], ws["B%d" % R(55)] = "Particulars ", " FY %d-%02d" % (fy - 1, fy % 100)
+    ws["C%d" % R(55)] = "%s to %s" % (_mlab(months[0]), _mlab(months[-1])) if months else None
+    ws["A%d" % R(56)], ws["B%d" % R(56)], ws["C%d" % R(56)] = "Total sales", "=C%d" % R(10), "=E%d" % last
+    ws["A%d" % R(57)], ws["B%d" % R(57)], ws["C%d" % R(57)] = "Average monthly sales", "=B%d/12" % R(56), "=C%d/%d" % (R(56), max(1, len(months)))
+    return o
+
+
+def fw_debtors(ws, F, cfg, X, P, so):
+    n = len(P); o = max(0, n - 3)
+    _grow(ws, 6, o)
+    ws["E1"] = 100000
+    for c, t in zip("BCDEF", ["Month", "Total Debtors", "Sales", "Cumulative Sales", "Holding period"]):
+        ws[c + "2"] = t
+    for i, p in enumerate(P):
+        r = 3 + i
+        ws["B%d" % r], ws["C%d" % r], ws["D%d" % r] = "='Stock Holding'!A%d" % r, X["L"](_at(F["deb_tot"], p["day"])), "='Stock Holding'!D%d" % r
+        ws["E%d" % r] = "=D%d" % r if i == 0 else "=D%d+E%d" % (r, r - 1)
+        ws["F%d" % r], ws["G%d" % r] = "=+C%d/E%d*G%d" % (r, r, r), "='Stock Holding'!G%d" % r
+    ws["B%d" % (3 + n)], ws["F%d" % (3 + n)] = "Average", "=AVERAGE(F3:F%d)" % (2 + n)
+    R = lambda r: r + o
+    fy = X["base"].year - 1 if X["base"].month >= 4 else X["base"].year - 2
+    for c, t in zip("BCDE", ["Year", "Total Debtors", "Sales", "Holding period"]):
+        ws["%s%d" % (c, R(10))] = t
+    r = R(11)
+    ws["B%d" % r], ws["D%d" % r], ws["E%d" % r], ws["F%d" % r] = "F.Y. %d-%02d" % (fy - 1, fy % 100), "='Stock Holding'!C%d" % (10 + so), "=C%d/D%d*F%d" % (r, r, r), 365
+    ws["C%d" % r] = (cfg.get("annual") or {}).get("debtors")
+    # debtors of 5% or more on the visit date (books ageing of that day), else the base date
+    day = X["visit"] if X["visit"] in X["ages"] else X["base"]
+    ag = X["ages"].get(day)
+    ws["B%d" % R(13)] = "In excess of 5%"
+    ws["B%d" % R(14)], ws["C%d" % R(14)], ws["D%d" % R(14)] = "Name of The Debtor", "O/S", "Share (%)"
+    big = []
+    if ag:
+        tot = ag["lt90"] + ag["gt90"]
+        big = sorted([(nm, lt + gt) for nm, lt, gt in ag["parties"] if tot and lt + gt >= 0.05 * tot], key=lambda x: -x[1])
+    t = R(15) + len(big)
+    for k, (nm, v) in enumerate(big):
+        rr = R(15) + k
+        ws["B%d" % rr], ws["C%d" % rr], ws["D%d" % rr] = nm, v / 1e5, "=C%d/$C$%d" % (rr, t)
+    ws["B%d" % t], ws["C%d" % t] = "Total Debtors", "='DP calculation'!%s8" % ("E" if day == X["visit"] else "D")
+    t0 = max(R(25), t + 6)
+    for c, h in zip("BCDEF", ["Month", "Sale as per GSTR3B", "Receivables amount as per Stock statement",
+                              "Receivables amount as per Books of Accounts", "Variance %"]):
+        ws["%s%d" % (c, t0)] = h
+    for i, p in enumerate(P):
+        r = t0 + 1 + i
+        ws["B%d" % r], ws["C%d" % r] = "=B%d" % (3 + i), "='Stock Holding'!D%d" % (3 + i)
+        ws["D%d" % r], ws["E%d" % r] = (X["ss"].get(p["day"]) or {}).get("debtors"), "=C%d" % (3 + i)
+        ws["F%d" % r] = '=IFERROR((D%d-E%d)/D%d,"")' % (r, r, r)
+    k0 = t0 + n + 3
+    ws["B%d" % k0] = "Key Supplier and buyers"
+    for c, h in zip("BCDE", ["Party Name", "PAN", "Transaction", "Amount"]):
+        ws["%s%d" % (c, k0 + 1)] = h
+    # key buyers / suppliers = the parties of the invoices picked for the Invoice sheet (as the drafts do): buyers with
+    # their debtor balance (ageing of the same day), PAN = GSTIN characters 3-12 where the invoice prints it
+    inv_resolve(F, list(cfg["own"]) + sorted(F["names"]), cfg.get("gstin") or "")
+    bal = {nospace(nm.upper())[:12]: lt + gt for nm, lt, gt in (ag["parties"] if ag else [])}
+    r = k0 + 2
+    for kind, lab in (("sales", "SALES"), ("purchase", "PURCHASE")):
+        rows = []
+        for x in pick_invoices(F, kind):
+            if x["unread"] or not x.get("party"):
+                continue
+            pan = (x["seller_gstin"] or "")[2:12] if kind == "purchase" else ""
+            amt = bal.get(nospace(x["party"].upper())[:12]) if kind == "sales" else None
+            rows.append((x["party"], pan or None, lab, amt / 1e5 if amt else None))
+        for row in sorted(rows, key=lambda t: -(t[3] or 0)):         # largest balance first, as the drafts list them
+            ws["B%d" % r], ws["C%d" % r], ws["D%d" % r], ws["E%d" % r] = row
+            r += 1
+
+
+def fw_creditors(ws, F, cfg, X, P):
+    n = len(P); o = max(0, n - 3)
+    _grow(ws, 6, o)
+    for c, t in zip("BCDEF", ["Month", "Total Creditors", "Purchases", "Cumulative Purchases", "Holding period"]):
+        ws[c + "2"] = t
+    for i, p in enumerate(P):
+        r = 3 + i
+        ws["B%d" % r], ws["C%d" % r] = "='Debtors Holding'!B%d" % r, X["L"](_at(F["cred_tot"], p["day"], creditors=True))
+        ws["D%d" % r] = "='Stock Holding'!B%d" % r
+        ws["E%d" % r] = "=D%d" % r if i == 0 else "=D%d+E%d" % (r, r - 1)
+        ws["F%d" % r], ws["G%d" % r] = "=C%d/E%d*G%d" % (r, r, r), "='Stock Holding'!G%d" % r
+    ws["B%d" % (3 + n)], ws["F%d" % (3 + n)] = "Average", "=AVERAGE(F3:F%d)" % (2 + n)
+    R = lambda r: r + o
+    fy = X["base"].year - 1 if X["base"].month >= 4 else X["base"].year - 2
+    for c, t in zip("BCDE", ["Year", "Total Creditors", "Purchases", "Holding period"]):
+        ws["%s%d" % (c, R(9))] = t
+    ws["B%d" % R(10)], ws["E%d" % R(10)], ws["F%d" % R(10)] = "F.Y. %d-%02d" % (fy - 1, fy % 100), "=C%d/D%d*F%d" % (R(10), R(10), R(10)), 365
+    ws["C%d" % R(10)], ws["D%d" % R(10)] = (cfg.get("annual") or {}).get("creditors"), (cfg.get("annual") or {}).get("purchases")
+    for c, t in zip("BCDEF", ["Month", "Purchase as per GSTR2B", "Creditors amount as per Stock statement",
+                              "Creditors amount as per Books of Accounts", "Variance %"]):
+        ws["%s%d" % (c, R(12))] = t
+    for m in [m for m in list(ws.merged_cells.ranges) if m.min_col == 3 and m.min_row == R(13)]:
+        ws.unmerge_cells(str(m))
+    for i, p in enumerate(P):
+        r = R(13) + i
+        ws["B%d" % r], ws["D%d" % r] = "=B%d" % (3 + i), (X["ss"].get(p["day"]) or {}).get("creditors")
+        ws["E%d" % r], ws["F%d" % r] = "=C%d" % (3 + i), '=IFERROR((E%d-D%d)/E%d,"")' % (r, r, r)
+    ws["C%d" % R(13)] = "Unable to comment"            # no GSTR-2B in the documents
+    if n > 1:
+        ws.merge_cells(start_row=R(13), start_column=3, end_row=R(13) + n - 1, end_column=3)
+    c0 = max(R(19), R(13) + n + 3)
+    ws["C%d" % c0], ws["D%d" % c0], ws["E%d" % c0] = "Name of The Creditor", "O/S", "Share (%)"
+
+
 def build_excel_draft(F, cfg, out):
     """Workbook in the user's own layout: summation, Insurance, GST (template = blank copy of their draft)."""
     allc = []
@@ -2261,7 +2666,14 @@ def build_excel_draft(F, cfg, out):
         for r in classify(dedupe(tx), F, cfg["related"], cfg["own"]):
             r["acc"] = acc; allc.append(r)
     wb = openpyxl.load_workbook(TEMPLATE)
-    draft_invoice(wb.create_sheet("Invoice", 0), F, cfg)
+    draft_invoice(wb["Invoice"] if "Invoice" in wb.sheetnames else wb.create_sheet("Invoice", 0), F, cfg)
+    if "Facility sanctioned" in wb.sheetnames:          # the firm's full workbook (9 sheets)
+        X = fw_ctx(F, cfg); P = fw_periods(F, X)
+        fw_facility(wb["Facility sanctioned"], F, cfg, X)
+        fw_dp(wb["DP calculation"], F, cfg, X)
+        so = fw_stock(wb["Stock Holding"], F, cfg, X, P)
+        fw_debtors(wb["Debtors Holding"], F, cfg, X, P, so)
+        fw_creditors(wb["Creditors Holding"], F, cfg, X, P)
     draft_summation(wb["summation"], F, cfg, allc)
     draft_insurance(wb["Insurance"], F, cfg)
     draft_gst(wb["GST"], F, cfg)
@@ -2463,17 +2875,28 @@ def browser_make(form_json, out):
             extra.append(dict(date=d(parts[0]), label=parts[1] if len(parts) > 1 and parts[1] else None,
                               stock=num(parts[2]) if len(parts) > 2 and parts[2] else None))
     own = lines(f.get("own"))
+    def sn(x):                                          # a typed figure; text that is not a number -> blank, not an error
+        try:
+            return num(re.sub(r"(?i)lakh|lacs?|rs\.?", "", x)) if x and x.strip() else None
+        except ValueError:
+            return None
     banks = []
-    for l in lines(f.get("banks")):
+    for l in lines(f.get("banks")):                     # 'Axis Bank, 590'  /  'Union Bank, 450, Overdraft'
         parts = [x.strip() for x in re.split(r"[,:]", l)]
         if parts and parts[0]:
-            banks.append((parts[0], num(parts[1]) if len(parts) > 1 and parts[1] else None))
+            banks.append((parts[0], sn(parts[1]) if len(parts) > 1 else None, parts[2] if len(parts) > 2 else ""))
+    facilities = []                                     # 'WCTL GECL, 49.5, 12.375, 8.25' (first bank, besides CC)
+    for l in lines(f.get("fac")):
+        parts = [x.strip() for x in l.split(",")] + [""] * 4
+        if parts[0]:
+            facilities.append((parts[0], sn(parts[1]), sn(parts[2]), sn(parts[3])))
     fr, to = default_period(F)
     pf = lambda k, dflt: (lambda m: (int(m.group(2)) + (2000 if int(m.group(2)) < 100 else 0), MON[m.group(1)[:3].lower()]) if m else dflt)(
         re.match(r"\s*([A-Za-z]{3,9})[\s'-]*(\d{2,4})", f.get(k) or ""))
-    fl = lambda k: num(f[k]) if str(f.get(k) or "").strip() else None
+    fl = lambda k: sn(str(f.get(k) or ""))
     cfg = dict(own=own, borrower=own[0] if own else "", gstin=(f.get("gstin") or "").strip(), related=lines(f.get("related")), extra=extra,
-               banks=banks, sum_from=pf("from", fr), sum_to=pf("to", to), pm_value=fl("pm"), collateral_value=fl("coll"),
+               annual=dict(zip(("stock", "sales", "debtors", "creditors", "purchases"), [sn(x.strip()) for x in (f.get("annual") or "").split(",")] + [None] * 5)),
+               banks=banks, facilities=facilities, sum_from=pf("from", fr), sum_to=pf("to", to), pm_value=fl("pm"), collateral_value=fl("coll"),
                visit=extra[0]["date"] if extra else None, visit_stock=extra[0]["stock"] if extra else None)
     build_excel_draft(F, cfg, out)
     return re.sub(r"[^\w .-]", "", cfg["borrower"] or "Borrower")[:60].strip()
