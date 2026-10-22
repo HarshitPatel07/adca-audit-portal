@@ -557,11 +557,16 @@ def tally_end(head):
 
 
 def tally_stock(rows, head):
+    """Grand Total of a Tally Stock Summary, plus its item rows (name, quantity, rate, value) - the Stock Holding sheet
+    lists the six largest items of the visit-date stock (Gold Star: Goods P.P. 16,488.525 @ 158.7152 ...)."""
     for r in rows:
         if r and str(r[0]).strip() == "Grand Total":
             v = [c for c in r[1:] if isinstance(c, (int, float))]
             if v:
-                return dict(date=tally_end(head), stock=round(v[-1] / 1e5, 5))
+                items = [(str(x[0]).strip(), x[1], x[2], x[3]) for x in rows
+                         if len(x) > 3 and x[0] and str(x[0]).strip() != "Grand Total"
+                         and all(isinstance(x[k], (int, float)) for k in (1, 2, 3))]
+                return dict(date=tally_end(head), stock=round(v[-1] / 1e5, 5), items=items)
     return None
 
 
@@ -1248,8 +1253,11 @@ def invoice_page(t, own_names=(), kind_hint=""):
            if re.search(CO_WORDS, x, re.I) and not re.search(r"IRN|Ack|Invoice\s*$", x)]
     buyer = re.search(r"Buyer\s*\(Bill\s*to\)\s*\n\s*([^\n]+)", f, re.I)
     gstins = re.findall(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z])\b", f)
+    bpos = buyer.start() if buyer else -1             # the buyer's GSTIN: the first one printed after 'Buyer (Bill to)'
+    bg = re.search(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z])\b", f[bpos:]) if bpos >= 0 else None
     x = dict(unread=not best, hint=kind_hint, cos=cos[:6], buyer=buyer.group(1).strip(" |") if buyer else "",
-             seller_gstin=gstins[0] if gstins else "", no=no or "", date=d(dte) if dte else None, item=item,
+             seller_gstin=gstins[0] if gstins else "", buyer_gstin=bg.group(1) if bg else "",
+             total=max(amounts) if amounts else None, no=no or "", date=d(dte) if dte else None, item=item,
              uom=best[1] if best else "", qty=best[0] if best else None, rate=best[2] if best else None)
     x["party"] = x["buyer"] or (cos[0] if cos else "")          # provisional (page grouping); final in inv_resolve
     return x
@@ -2008,7 +2016,12 @@ def draft_summation(ws, F, cfg, allc):
         tx = [t for t in dedupe(F["bank"][acc]) if inp(t)]
         dr = sum(-t["amt"] for t in tx if t["amt"] < 0)
         # credits as the drafts total them: every credit, less transfers from own accounts and from directors / related parties
-        ex = sum(r["amt"] for r in allc if r["acc"] == acc and inp(r) and r["cat"].startswith(("Self-transfer", "Director")))
+        # sister concerns / other related parties stay in (they are trade receipts in the drafts); directors and own a/c out
+        dirs = [x.upper() for x in F.get("directors", [])]
+        is_dir = lambda r: r["why"].startswith("Promoter-director") or any(
+            r["why"].upper().startswith("RELATED PARTY / DIRECTOR: " + x) for x in dirs)
+        ex = sum(r["amt"] for r in allc if r["acc"] == acc and inp(r) and
+                 (r["cat"].startswith("Self-transfer") or (r["cat"].startswith("Director") and is_dir(r))))
         cr = sum(t["amt"] for t in tx if t["amt"] > 0) - ex
         return _lakh(dr), _lakh(cr)
 
@@ -2601,6 +2614,11 @@ def fw_stock(ws, F, cfg, X, P):
     ws["R1"], ws["U1"], ws["Q2"], ws["R2"], ws["S2"] = "Books", "SS", "Stock", "Debtors", "Creditors"
     for c, t in zip("ABCD", ["Inventory Details", "Quantity", "Rate", "Value in INR"]):
         ws["%s%d" % (c, R(12))] = t; ws["%s%d" % (c, R(21))] = t
+    # six largest items of the visit-date book stock (Tally stock summary of that day), value = quantity x rate
+    vis = next((b for b in F["book"] if b.get("date") == X["visit"] and b.get("items")), None)
+    for k, (nm, q, rt, val) in enumerate(sorted(vis["items"], key=lambda x: -x[3])[:6] if vis else []):
+        r = R(13) + k
+        ws["A%d" % r], ws["B%d" % r], ws["C%d" % r], ws["D%d" % r] = nm, q, rt, "=B%d*C%d" % (r, r)
     vn = X["visit"].strftime("%d-%m-%Y") if X["visit"] else ""
     ws["A%d" % R(28)], ws["D%d" % R(28)] = "Total value of Stock physically verified on %s (Value Rs. in INR) " % vn, "=SUM(D%d:D%d)" % (R(22), R(27))
     ws["A%d" % R(29)], ws["D%d" % R(29)] = "Total value of Stock physically verified on %s (Value Rs. in lakh)" % vn, "=(D%d)/100000" % R(28)
@@ -2690,10 +2708,12 @@ def fw_debtors(ws, F, cfg, X, P, so):
         for x in pick_invoices(F, kind):
             if x["unread"] or not x.get("party"):
                 continue
-            pan = (x["seller_gstin"] or "")[2:12] if kind == "purchase" else ""
-            amt = bal.get(nospace(x["party"].upper())[:12]) if kind == "sales" else None
+            # PAN = GSTIN characters 3-12: the supplier's on a purchase, the buyer's on a sale
+            pan = ((x["seller_gstin"] if kind == "purchase" else x.get("buyer_gstin")) or "")[2:12]
+            # buyers: their debtor balance; suppliers: the invoice value (Gold Star Magnum 9,44,000 -> 9.44)
+            amt = bal.get(nospace(x["party"].upper())[:12]) if kind == "sales" else x.get("total")
             rows.append((x["party"], pan or None, lab, amt / 1e5 if amt else None))
-        for row in sorted(rows, key=lambda t: -(t[3] or 0)):         # largest balance first, as the drafts list them
+        for row in rows:                                              # invoice order, as the drafts list them
             ws["B%d" % r], ws["C%d" % r], ws["D%d" % r], ws["E%d" % r] = row
             r += 1
 
