@@ -2820,19 +2820,34 @@ def build_excel_draft(F, cfg, out):
 
 
 def default_period(F):
-    """Summation period: six months ending at the latest stock month (stock statement or books - the drawing-power base)
-    that the bank statements cover. A stock date outside the statements (Denis: only Mar'25 read, bank Sep'25-Aug'26)
-    would give a period with no bank rows, so the bank's last month is used then."""
+    """Summation period, as the firm's drafts choose it (raw data only):
+    - stock statements quarterly (Gold Star: Sep / Dec / Mar / Jun): six months ending at the latest one;
+    - otherwise: from the month after the books' first debtor month-end (the opening debtors) for up to 12 months,
+      ending at the last complete month that both the bank statements and the books cover
+      (Bhawani Nov'24-Oct'25, Denis Oct'25-Aug'26, Clan Aug'25-Jun'26, Baid May'25-Feb/Mar'26).
+    An OCR-read date never sets the period."""
     bank = [t["date"] for tx in F["bank"].values() for t in tx]
-    ss = [s["date"] for s in F["ss"] if s.get("date") and not s.get("check")]   # an OCR-read date never sets the period
-    book = [s["date"] for s in F["book"] if s.get("date")]       # books only when no stock statement fits (the
-    if bank:                                                      # latest book stock is often the visit date)
+    ss = sorted({s["date"] for s in F["ss"] if s.get("date") and not s.get("check")})
+    ym = lambda x: (x.year, x.month)
+    full = lambda x: x == month_end(x.year, x.month)
+    if bank:
         lo, hi = min(bank), max(bank)
-        fit = lambda xs: [x for x in xs if (lo.year, lo.month) <= (x.year, x.month) <= (hi.year, hi.month)]
-        end = max(fit(ss) or fit(book) or [hi])
+        last_bank = ym(hi) if full(hi) else _ym_add(ym(hi), -1)
+        inb = [x for x in ss if ym(lo) <= ym(x) <= last_bank]
+        if len(inb) >= 2 and min((b.year * 12 + b.month) - (a.year * 12 + a.month) for a, b in zip(inb, inb[1:])) >= 3:
+            to = ym(inb[-1])
+            return _ym_add(to, -5), to
+        deb = sorted({r["date"] for r in F.get("deb_tot", []) if r.get("date") and full(r["date"])})
+        if deb:
+            first = _ym_add(ym(deb[0]), 1)
+            last = min(ym(deb[-1]), last_bank)
+            if first <= last:
+                return first, min(last, _ym_add(first, 11))
+        end = max(inb or [hi])
     else:
+        book = [s["date"] for s in F["book"] if s.get("date")]
         end = max(ss or book or [dt.date.today()])
-    to = (end.year, end.month)
+    to = ym(end)
     return _ym_add(to, -5), to
 
 
