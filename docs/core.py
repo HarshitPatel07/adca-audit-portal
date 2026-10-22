@@ -70,6 +70,11 @@ BANK_HEAD = [(r"A\s*X\s*I\s*S\s+B\s*A\s*N\s*K|Axis Bank", "Axis Bank"), (r"State
              (r"Indian Overseas Bank", "Indian Overseas Bank"), (r"UCO Bank", "UCO Bank"), (r"Federal Bank", "Federal Bank")]
 
 
+SHEET_BANK = [(r"axis", "Axis Bank"), (r"hdfc", "HDFC Bank"), (r"sbi|state bank", "State Bank of India"), (r"scb|standard", "Standard Chartered Bank"),
+              (r"icici", "ICICI Bank"), (r"iob", "Indian Overseas Bank"), (r"uco", "UCO Bank"), (r"kotak", "Kotak Mahindra Bank"),
+              (r"union|ubi", "Union Bank of India"), (r"bob|baroda", "Bank of Baroda"), (r"pnb", "Punjab National Bank")]
+
+
 def bank_of(t):
     """Bank that issued the statement, from its header only (narrations name other banks: 'ACH ICICI BANK-...')."""
     head = t[:600] if "STATEMENT" in t[:1500] else t[:1500]
@@ -150,13 +155,14 @@ def bank_table(rows):
     """Any spreadsheet statement: Date + Narration + either separate Debit / Credit columns, or one Amount column with a
     Dr/Cr column. Returns (account no or None, transactions)."""
     top = " ".join(str(c) for r in rows[:10] for c in r if c)
-    acc = re.search(r"(?:Account|A/c)\s*(?:No|Number)\.?\s*:?\s*(\d{9,})", top, re.I)
+    acc = re.search(r"(?:Account|A/c)\s*(?:No|Number)\.?\s*:?\s*_?(\d{9,})", top, re.I)
     for i, r in enumerate(rows[:40]):
         low = [str(c or "").lower().strip() for c in r]
         di = next((j for j, c in enumerate(low) if "date" in c), None)
         ni = next((j for j, c in enumerate(low) if any(k in c for k in ("narration", "particular", "description", "remarks", "details"))), None)
-        sg = next((j for j, c in enumerate(low) if re.fullmatch(r"(debit\s*/\s*credit|dr\s*/\s*cr|cr\s*/\s*dr|type|dr/cr)", c)), None)
-        am = next((j for j, c in enumerate(low) if c.startswith("amount")), None)
+        # 'DR|CR' (Axis), 'Debit / Credit' (HDFC), 'Dr/Cr'; amount column 'Amount(INR)' / 'Transaction Amount'
+        sg = next((j for j, c in enumerate(low) if re.fullmatch(r"(debit\s*[/|]\s*credit|dr\s*[/|]\s*cr|cr\s*[/|]\s*dr|type|dr/cr)", c)), None)
+        am = next((j for j, c in enumerate(low) if re.match(r"(transaction\s*)?amount", c)), None)
         dr = next((j for j, c in enumerate(low) if j != sg and any(k in c for k in ("debit", "withdrawal"))), None)
         cr = next((j for j, c in enumerate(low) if j != sg and any(k in c for k in ("credit", "deposit"))), None)
         bl = next((j for j, c in enumerate(low) if "balance" in c), None)
@@ -166,8 +172,7 @@ def bank_table(rows):
         for rr in rows[i + 1:]:
             if len(rr) <= max(x for x in (di, ni, dr, cr, am, sg, bl) if x is not None):
                 continue
-            dd = rr[di]
-            dd = dd.date() if isinstance(dd, dt.datetime) else d(str(dd or ""))
+            dd = _cell_date(rr[di])                  # also '29/06/2025 14:19:02' (HDFC)
             if not dd:
                 continue
             if dr is not None and cr is not None:
@@ -177,6 +182,8 @@ def bank_table(rows):
                 a = v if str(rr[sg] or "").strip().upper().startswith("C") else -v
             if a:
                 tx.append(dict(date=dd, narr=str(rr[ni] or ""), amt=round(a, 2), bal=_cellnum(rr[bl]) if bl is not None else None))
+        if len(tx) > 1 and tx[0]["date"] > tx[-1]["date"]:
+            tx.reverse()                                 # newest-first statements (HDFC, Standard Chartered)
         return (acc.group(1) if acc else None), tx
     return None, []
 
@@ -291,6 +298,94 @@ def outward_file(F, p, log):
     log.append(("GST outward", os.path.basename(p), "%d rows, taxable %s (%s)" % (len(rows), "{:,.2f}".format(tax),
                                                                                 "; ".join(n.split(": ", 1)[-1] for n in notes)[:200])))
     return True
+
+
+def sheet_tops(p, n=60):
+    """The first n rows of every sheet of a workbook (cheap look for a statement table on any sheet)."""
+    out = []
+    try:
+        wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+        for ws in wb.worksheets:
+            out.append([list(r) for r in ws.iter_rows(max_row=n, values_only=True)])
+        wb.close()
+    except Exception:
+        pass
+    return out
+
+
+def _date_in_name(fn):
+    """'Debtors OD as on 30 APR 25', '30 April'24', '03 OCT 2024', 'as on 30.04.2025', '30JUN25' -> date"""
+    s = re.sub(r"[_]", " ", fn)
+    m = re.search(r"(\d{1,2})[\s.\-]*([A-Za-z]{3,9})[\s.'\-]*(\d{2,4})", s) or None
+    if m and m.group(2)[:3].lower() in MON:
+        y = int(m.group(3)); y = y + 2000 if y < 100 else y
+        try:
+            return dt.date(y, MON[m.group(2)[:3].lower()], int(m.group(1)))
+        except ValueError:
+            pass
+    m = re.search(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})", s)
+    if m:
+        y = int(m.group(3)); y = y + 2000 if y < 100 else y
+        try:
+            return dt.date(y, int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    return None
+
+
+def debtor_od(p):
+    """Company debtors ageing workbook (Chemfab 'CAL / PVCO Debtors OD as on 30 APR 25.xlsx'): the bill-wise sheet with
+    'Amount' and 'Days in Arrears' -> total, > 90 days (bills more than 90 days in arrears), per customer.
+    Dated by the file name. Returns dict(date, total, gt90, parties) in Rs, or None."""
+    day = _date_in_name(os.path.basename(p))
+    if not day:
+        return None
+    for name, rows in sheet_tables(p):
+        for hi, r in enumerate(rows[:5]):
+            h = [str(c or "").strip().lower() for c in r]
+            ai = next((i for i, c in enumerate(h) if c.startswith("amount")), None)
+            di = next((i for i, c in enumerate(h) if "days in arrears" in c), None)
+            ni = next((i for i, c in enumerate(h) if c == "customer name"), None)
+            if ai is None or di is None:
+                continue
+            tot = gt = 0.0; parties = collections.defaultdict(lambda: [0.0, 0.0])
+            for rr in rows[hi + 1:]:
+                if len(rr) <= max(ai, di) or not isinstance(rr[ai], (int, float)) or not isinstance(rr[di], (int, float)):
+                    continue
+                v = float(rr[ai]); old = rr[di] > 90
+                tot += v; gt += v if old else 0
+                if ni is not None and rr[ni]:
+                    parties[str(rr[ni]).strip()][1 if old else 0] += v
+            if tot:
+                return dict(date=day, total=tot, gt90=gt, parties=[(k, a, b) for k, (a, b) in parties.items()])
+    return None
+
+
+def stock_creditors_table(rows):
+    """Company table 'Month | Stock | Sundry creditors | Creditors pertaining to stock | ... ' (Chemfab 'stock and creditors
+    april to jun'25.xlsx'): month-end book stock (Rs) and the creditors pertaining to stock (Rs lakh as printed)."""
+    for hi, r in enumerate(rows[:6]):
+        h = [str(c or "").strip().lower() for c in r]
+        if not (h and h[0] == "month" and any(c == "stock" for c in h)):
+            continue
+        si = h.index("stock"); ci = next((i for i, c in enumerate(h) if c.startswith("creditors pertai")), None)
+        out, y, prev = [], None, None
+        for rr in rows[hi + 1:]:
+            m = re.match(r"\s*([A-Za-z]{3,9})[\s']*(\d{2,4})?", str(rr[0] or ""))
+            if not m or m.group(1)[:3].lower() not in MON or len(rr) <= si or not isinstance(rr[si], (int, float)):
+                continue
+            mo = MON[m.group(1)[:3].lower()]
+            if m.group(2):
+                y = int(m.group(2)); y = y + 2000 if y < 100 else y
+            elif prev is not None and mo < prev:
+                y += 1
+            if y is None:
+                continue
+            prev = mo
+            cr = rr[ci] if ci is not None and len(rr) > ci and isinstance(rr[ci], (int, float)) else None
+            out.append(dict(date=month_end(y, mo), stock=round(float(rr[si]) / 1e5, 5), cred_lakh=cr))
+        return out
+    return []
 
 
 def _hdr(c):
@@ -1016,6 +1111,26 @@ def tally_pdf_sales(t):
     return out or None
 
 
+def stock_receivable_statement(t):
+    """'STOCK AND RECEIVABLE STATEMENT AS ON 30-APRIL-2025' (Chemfab, scanned -> OCR): stock-in-trade, unpaid stock /
+    creditors, total book debts and the receivables over the permissible tenor (> 90 days), Rs lakh. Marked for checking."""
+    f = t.replace("\n", " ")
+    m = re.search(r"STATEMENT\s+AS\s+ON\s+(\d{1,2})[\s.\-]*([A-Za-z]{3,9})[\s.\-]*(\d{4})", f, re.I)
+    if not m or m.group(2)[:3].lower() not in MON:
+        return None
+    try:
+        day = dt.date(int(m.group(3)), MON[m.group(2)[:3].lower()], int(m.group(1)))
+    except ValueError:
+        return None
+    amt = lambda rx: (lambda x: num(x.group(1)) if x else None)(re.search(rx + r"[^0-9]{0,60}?(\d[\d,]*\.\d{1,2})", f, re.I))
+    stock = amt(r"Stock\s*-?\s*in\s*-?\s*trade")
+    if stock is None:
+        return None
+    deb, gt = amt(r"Total\s*Book\s*Debts"), amt(r"over\s*the\s*above\s*Rs\.?")
+    return dict(date=day, stock=stock, creditors=amt(r"Unpaid\s*stock\s*/?\s*creditors?"), debtors=deb, gt90=gt,
+                lt90=round(deb - gt, 2) if deb is not None and gt is not None else None, split=None, check=True)
+
+
 def company_stock_statement(t):
     """Company-format stock statement ('Stock Statement as on dd-mm-yyyy', 'Rs. in Lacs'): stock, unpaid creditors, book debts.
     Text is often OCR'd - '1,,026.87' and similar are cleaned, and the result is marked for checking."""
@@ -1434,7 +1549,7 @@ def scan_file(F, p, log):
                     else:
                         r = tally_pdf_sales(t) or {}; F.setdefault("sales", {}).update(r)
                         log.append(("Books sales", fn, "%d months (PDF)" % len(r)))
-                elif stock_month_table(t):
+                elif stock_month_table(t) and not re.search(r"annual\s*report|sustainability|board meeting|results|balance sheet|directors.? report", fn + " " + t[:3000], re.I):   # a company report's tables are not book stock
                     r = stock_month_table(t); F["book"].extend(r)
                     log.append(("Book stock", fn, "%d month-ends from a monthly stock table (PDF)" % len(r)))
                 elif re.search(r"1ST CHG ON IMMOVABLE PROP", t, re.I):
@@ -1485,11 +1600,25 @@ def scan_file(F, p, log):
             if ext == "csv":
                 rows = [l.rstrip("\n").split(",") for l in open(p, encoding="utf-8", errors="replace")]
             else:
+                od = debtor_od(p) if re.search(r"debtor|\bOD\b|outstanding", fn, re.I) else None
+                if od:                                        # company debtors ageing workbook (bill-wise)
+                    F.setdefault("od_parts", []).append(od)
+                    log.append(("Debtor ageing", fn, "%s: total %.2f lakh, > 90 days %.2f lakh (bill-wise)" % (od["date"], od["total"] / 1e5, od["gt90"] / 1e5)))
+                    return
+                sc = stock_creditors_table(xlsx_rows(p, 60))
+                if sc:                                        # company month-wise stock and creditors table
+                    for x in sc:
+                        F["book"].append(dict(date=x["date"], stock=x["stock"]))
+                        if x["cred_lakh"] is not None:
+                            F["cred_tot"].append(dict(date=x["date"], dr=0.0, cr=x["cred_lakh"] * 1e5))
+                    log.append(("Book stock", fn, "%d month-ends (company stock & creditors table)" % len(sc)))
+                    return
                 # classify from the first 200 rows; read the whole workbook only for a type that is used
                 # (big sales registers / GST Excel downloads took 40-85 s each to read in full)
                 top = xlsx_rows(p, 200)
                 k0, h0 = tally_kind(top)
-                if not (k0 or tally_sales(top, h0) or tally_purchase(top, h0) or mca_directors(top) or bank_table(top)[1]):
+                if not (k0 or tally_sales(top, h0) or tally_purchase(top, h0) or mca_directors(top) or bank_table(top)[1]
+                        or any(bank_table(r)[1] for r in sheet_tops(p))):     # a statement on a later sheet
                     log.append(("skipped", fn, "not recognised")); return
                 rows = xlsx_rows(p)
             k, head = tally_kind(rows)
@@ -1517,13 +1646,18 @@ def scan_file(F, p, log):
             elif mca_directors(rows):
                 F["directors"] = mca_directors(rows); F["dins"] = mca_dins(rows); log.append(("MCA", fn, ", ".join(F["directors"])))
             else:
-                acc, tx = bank_table(rows)
-                if tx:
+                got = 0
+                for sname, srows in (sheet_tables(p) if ext != "csv" else [(fn, rows)]):
+                    acc, tx = bank_table(srows)
+                    if not tx:
+                        continue
+                    key = acc or (sname.strip() if ext != "csv" else fn)    # same sheet name in two files = same account
                     [x.update(src=fn) for x in tx]
-                    F["bank"].setdefault(acc or fn, []).extend(tx)
-                    F["bank_name"][acc or fn] = F["bank_name"].get(acc or fn) or bank_of(" ".join(str(c) for r in rows[:sheet_head(rows)] for c in r if c))
-                    log.append(("Bank sheet", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
-                else:
+                    F["bank"].setdefault(key, []).extend(tx)
+                    F["bank_name"][key] = F["bank_name"].get(key) or bank_of(" ".join(str(c) for r in srows[:sheet_head(srows)] for c in r if c)) \
+                        or bank_of(sname) or next((nm for rx, nm in SHEET_BANK if re.match(rx, sname.strip(), re.I)), "")
+                    log.append(("Bank sheet", "%s / %s" % (fn, sname), "%d txns; %s" % (len(tx), bal_msg(tx)))); got += 1
+                if not got:
                     log.append(("skipped", fn, "not recognised"))
         else:
             log.append(("skipped", fn, "type not used"))
@@ -1532,6 +1666,15 @@ def scan_file(F, p, log):
 
 
 def scan_end(F, log):
+    by = collections.OrderedDict()
+    for od in F.get("od_parts", []):                  # CAL + PVCO divisions of the same date = the company
+        g = by.setdefault(od["date"], dict(total=0.0, gt90=0.0, parties=[]))
+        g["total"] += od["total"]; g["gt90"] += od["gt90"]; g["parties"] += od["parties"]
+    for day, g in by.items():
+        F.setdefault("ageing", []).append(dict(date=day, lt90=g["total"] - g["gt90"], gt90=g["gt90"], parties=g["parties"]))
+        if not any(r["date"] == day for r in F["deb_tot"]):
+            F["deb_tot"].append(dict(date=day, dr=g["total"], cr=0.0))
+        F.setdefault("points", set()).add(day)
     # a sheet without an account number whose rows are the same as a real account's (e.g. a working copy such as
     # Summation.xlsx) is merged into that account - otherwise its credits would be counted twice
     accts = [k for k in F["bank"] if re.fullmatch(r"\d{9,}", k)]
@@ -2454,7 +2597,7 @@ def fw_ctx(F, cfg):
     # base date (DP and holdings): latest date with BOTH a stock statement (not OCR-read) and books, within 6 months
     # before the visit; else an 'as on' position before it (Bhawani 30-09-2025); else the latest book month-end before it
     near = lambda x: visit is None or (x < visit and (visit - x).days <= 190)
-    good_ss = [x for x, s in ss.items() if not s.get("check")]
+    good_ss = [x for x, s in ss.items() if not s.get("check") or s.get("date_ok")]
     base = max([x for x in good_ss if x in books and near(x)] or [x for x in good_ss if near(x)] or
                [x for x in points if near(x)] or [x for x in books if near(x) and x == month_end(x.year, x.month)] or
                [month_end(*cfg["sum_to"])])
@@ -2840,7 +2983,7 @@ def default_period(F):
       (Bhawani Nov'24-Oct'25, Denis Oct'25-Aug'26, Clan Aug'25-Jun'26, Baid May'25-Feb/Mar'26).
     An OCR-read date never sets the period."""
     bank = [t["date"] for tx in F["bank"].values() for t in tx]
-    ss = sorted({s["date"] for s in F["ss"] if s.get("date") and not s.get("check")})
+    ss = sorted({s["date"] for s in F["ss"] if s.get("date") and (not s.get("check") or s.get("date_ok"))})
     ym = lambda x: (x.year, x.month)
     full = lambda x: x == month_end(x.year, x.month)
     if bank:
@@ -3024,9 +3167,13 @@ def ocr_merge(path, text, fields_json):
         r = sanction_letter(text); F.setdefault("sanction", []).append(dict(bank=letter_bank(text), fac=r, file=fn, ocr=True))
         got.append("sanction letter: " + "; ".join("%s %s lakh" % x for x in r))
     if not got:
-        ss = stock_statement(text) or company_stock_statement(text)
+        ss = stock_statement(text) or stock_receivable_statement(text) or company_stock_statement(text)
         if ss:
-            ss["check"] = True; F["ss"].append(ss)
+            ss["check"] = True
+            nm = re.sub(r"[^A-Za-z0-9]", " ", fn).upper()
+            mon = dt.date(2000, ss["date"].month, 1).strftime("%b").upper() if ss.get("date") else ""
+            ss["date_ok"] = bool(mon and re.search(r"%s[A-Z]*\s*'?(?:20)?%02d\b" % (mon, ss["date"].year % 100), nm.replace(" ", " ")))
+            F["ss"].append(ss)
             got.append("stock statement %s: stock %s lakh" % (ss["date"], ss["stock"]))
     log.append(("OCR", fn, ("read: " + ", ".join(got) + " - CHECK these against the scan") if got else "OCR done - no policy / statement figures found"))
     return browser_summary()
