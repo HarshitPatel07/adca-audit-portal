@@ -200,6 +200,10 @@ function showReview(s) {
   $("own").value = s.borrower; $("gstin").value = s.gstins[0] || ""; $("related").value = s.directors.join("\n");
   $("from").value = (s.period || [])[0] || ""; $("to").value = (s.period || [])[1] || "";
   $("coll").value = s.collateral ?? "";
+  if (s.sanction) {          // limits read from the sanction letter - shown for checking, never over what was typed
+    if (!$("banks").value.trim()) $("banks").value = s.sanction.banks;
+    if (!$("fac").value.trim()) $("fac").value = s.sanction.fac;
+  }
   $("banks").addEventListener("input", checkWarnings);
   $("unreadCard").hidden = !s.unread.length; $("nUnread").textContent = s.unread.length;
   $("unread").innerHTML = "<tr><th>File</th><th>Why</th></tr>" + s.unread.map(u => `<tr><td>${esc(u[0])}</td><td class="small">${esc(u[1])}</td></tr>`).join("");

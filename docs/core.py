@@ -1099,6 +1099,43 @@ def gst_challan(t):
     return dict(cpin=cp.group(1), gstin=g.group(1) if g else "", paid=d(dd.group(1)), amount=num(am.group(1)))
 
 
+FAC_NAMES = r"Cash Credit|WCTL\s*(?:GECL)?|GECL|Term\s*Loan|Overdraft|Dropline Overdraft|Working Capital Demand Loan|WCDL|Letter of Credit|Bank Guarantee|Packing Credit|Bill Discounting"
+
+
+def letter_bank(t):
+    """The bank that wrote a letter = the bank named FIRST in it (a Union Bank letter also mentions 'pari passu with
+    Axis Bank' further down, so the list order of BANK_HEAD must not decide)."""
+    hits = [(m.start(), nm) for rx, nm in BANK_HEAD for m in [re.search(rx, t[:6000], re.I)] if m]
+    return min(hits)[1] if hits else ""
+
+
+def sanction_letter(t):
+    """Facilities and limits from a sanction / modification letter with a text layer (Gold Star SL.pdf: 'Cash Credit |
+    WCTL GECL | Term LOan | Total ... 5.90 | 0.25 | 0.33 | ... 6.48', Rs crore). Names in printed order, then the same
+    number of amounts; the total must add up, else nothing is taken. Returns [(facility, limit in lakh)] or None."""
+    f = t.replace("\n", "|")
+    if not re.search(r"sanction", f[:4000], re.I):
+        return None
+    s1 = re.search(r"sanction of\s+(OD|CC|Cash Credit|Overdraft|[A-Z]{2,5})\s+limit of\s+Rs\.?\s*([\d,]+(?:\.\d+)?)\s*(lakh|lacs?|crores?)",
+                   f.replace("|", " "), re.I)
+    if s1:                                                       # Union Bank (OCR): one limit stated in a sentence
+        v = float(s1.group(2).replace(",", "")) * (100 if s1.group(3).lower().startswith("cr") else 1)
+        nm = {"OD": "Overdraft", "CC": "Cash Credit"}.get(s1.group(1).upper(), s1.group(1).title())
+        return [(nm, round(v, 2))]
+    m = re.search(r"((?:\|\s*(?:%s)\s*)+)\|\s*Total\s*\|" % FAC_NAMES, f, re.I)
+    if not m:
+        return None
+    names = [re.sub(r"\s+", " ", x).strip().title().replace("Wctl", "WCTL").replace("Gecl", "GECL")
+             for x in re.findall(FAC_NAMES, m.group(1), re.I)]
+    nums = [float(x) for x in re.findall(r"\|\s*(\d{1,4}\.\d{1,2})\s*(?=\|)", f[m.end():m.end() + 1500])]
+    for i in range(0, max(0, len(nums) - len(names))):          # first run of amounts whose next figure is their total
+        part = nums[i:i + len(names)]
+        if len(part) == len(names) and abs(sum(part) - nums[i + len(names)]) < 0.015:
+            crore = (bool(re.search(r"\bCrs?\b|crore", f, re.I)) and max(part) < 1000) or max(part) < 50   # 5.90 = Rs crore
+            return [(n, round(v * 100, 2) if crore else v) for n, v in zip(names, part)]
+    return None
+
+
 def elec_bill_issue(t):
     """Electricity bill with a 'Billing Month' yyyymm table (JVVNL / Rajasthan discoms): billing month, bill issue date,
     due date and the Net Payable Amount - written as the drafts do (Bhawani Oct'25: 05-10-2025, 10,00,303)."""
@@ -1415,6 +1452,9 @@ def scan(paths, log):
                     elif policy(t, fn):
                         r = policy(t, fn); F["policies"].append(r); F["names"].add(r["insured"])
                         log.append(("Policy " + r["cls"], fn, "%s %s-%s stock SI %s" % (r["no"], r["frm"], r["to"], r["stock"])))
+                    elif sanction_letter(t):
+                        r = sanction_letter(t); F.setdefault("sanction", []).append(dict(bank=letter_bank(t), fac=r, file=fn))
+                        log.append(("Sanction letter", fn, "; ".join("%s %s lakh" % x for x in r) + " - CHECK on the page"))
                     elif re.search(r"Tax\s*Invoice|Invoice\s*No", t, re.I) and add_invoices(F, p, pdf_pages(p)):
                         r = [x for x in F["inv"] if x["file"] == fn]
                         log.append(("Invoice", fn, "%d invoice(s): %s" % (len(r), ", ".join(x["no"] or "page %d not readable" % x["page"] for x in r))))
@@ -2824,7 +2864,28 @@ def browser_summary():
         collateral=round(F["collateral"]["value"] / 1e5, 5) if F.get("collateral") else None,
         policies=[dict(no=p["no"], cls=p["cls"], frm=p["frm"], to=p["to"], stock=p["stock"], fl=p["first_loss"], build=p["build"],
                        file=p["file"], ocr=bool(p.get("ocr"))) for p in F["policies"]],
-        invoices=_review_invoices(F), unread=unk, log=log, ai=F.get("ai_rows", [])), default=str)
+        invoices=_review_invoices(F), unread=unk, log=log, ai=F.get("ai_rows", []), sanction=_sanction_prefill(F)), default=str)
+
+
+def _sanction_prefill(F):
+    """Check-page text for 'Banks' and 'Other facilities' from the latest sanction letter read (first = the CC line)."""
+    letters = F.get("sanction") or []
+    if not letters:
+        return None
+    main = _short_bank(next(iter((F.get("bank_name") or {}).values()), "") or "").lower()
+    by = {}
+    for s in letters:                  # one letter per bank: a text-layer letter beats an OCR-read one, else the latest
+        k = _short_bank(s["bank"]).lower() or s["file"]
+        if k not in by or not (s.get("ocr") and not by[k].get("ocr")):
+            by[k] = s
+    order = sorted(by.values(), key=lambda s: _short_bank(s["bank"]).lower() != main)
+    banks, fac = [], []
+    for k, s in enumerate(order):
+        cc = next((x for x in s["fac"] if re.search(r"cash credit|overdraft", x[0], re.I)), s["fac"][0])
+        banks.append("%s, %s, %s" % ((s["bank"] or "Bank").title(), cc[1], cc[0]))
+        if k == 0:
+            fac = ["%s, %s, , " % x for x in s["fac"] if x is not cc]
+    return dict(banks="\n".join(banks), fac="\n".join(fac), file=", ".join(s["file"] for s in order))
 
 
 def _review_invoices(F):
@@ -2861,8 +2922,7 @@ def ocr_candidates():
                 n = len(doc)
         except Exception:
             continue
-        if n <= OCR_MAX_PAGES:
-            out.append(dict(path=pth, file=fn, pages=n))
+        out.append(dict(path=pth, file=fn, pages=n if n <= OCR_MAX_PAGES else 3))
     return json.dumps(dict(files=out, fields=OCR_FIELDS))
 
 
@@ -2916,6 +2976,9 @@ def ocr_merge(path, text, fields_json):
         r = add_invoices(F, path, text.split("\f"), ocr=True)
         if r:
             got.append("%d invoice(s): %s" % (len(r), ", ".join(x["no"] or "page %d not readable - type it" % x["page"] for x in r)))
+    if not got and sanction_letter(text):
+        r = sanction_letter(text); F.setdefault("sanction", []).append(dict(bank=letter_bank(text), fac=r, file=fn, ocr=True))
+        got.append("sanction letter: " + "; ".join("%s %s lakh" % x for x in r))
     if not got:
         ss = stock_statement(text) or company_stock_statement(text)
         if ss:
