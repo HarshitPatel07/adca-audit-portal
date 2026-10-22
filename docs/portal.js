@@ -45,9 +45,18 @@ async function readDocs() {
       for (const part of rel) { dir += "/" + part; if (!py.FS.analyzePath(dir).exists) py.FS.mkdir(dir); }
       py.FS.writeFile(`${dir}/${files[i].name}`, new Uint8Array(await files[i].arrayBuffer()));
     }
-    status(`Reading ${files.length} files...`);
-    await new Promise(r => setTimeout(r, 30));
-    let s = JSON.parse(py.globals.get("core").browser_scan("/work"));
+    // read one file at a time and let the browser breathe in between - one long Python call froze the page
+    // ("Page Unresponsive" on 300+ files)
+    const core = py.globals.get("core");
+    const paths = JSON.parse(core.browser_scan_begin("/work"));
+    for (let i = 0; i < paths.length; i++) {
+      status(`Reading file ${i + 1} of ${paths.length}: ${paths[i].split("/").pop()}`);
+      await new Promise(r => setTimeout(r, 0));
+      core.browser_scan_step(paths[i]);
+    }
+    status("Checking what was read...");
+    await new Promise(r => setTimeout(r, 0));
+    let s = JSON.parse(core.browser_scan_end());
     s = await runOCR(s);
     s = await runAI(s);
     showReview(s);

@@ -1380,145 +1380,158 @@ def pick_invoices(F, kind, n=3):
 
 
 # ---------------- scan everything ----------------
+def scan_new():
+    return dict(bank={}, bank_name={}, inv=[], g1=[], g3=[], ss=[], book=[], debtors=set(), creditors=set(), directors=[], policies=[], names=set(),
+    pf=[], esic=[], elec=[], dins=[], deb_tot=[], cred_tot=[], challan=[], advtax=[], elec_ai=[])
+
+
 def scan(paths, log):
-    F = dict(bank={}, bank_name={}, inv=[], g1=[], g3=[], ss=[], book=[], debtors=set(), creditors=set(), directors=[], policies=[], names=set(),
-             pf=[], esic=[], elec=[], dins=[], deb_tot=[], cred_tot=[], challan=[], advtax=[], elec_ai=[])
+    """Read every file (one at a time - the browser calls scan_file per file so the page stays responsive)."""
+    F = scan_new()
     for p in paths:
-        fn = os.path.basename(p); ext = fn.lower().rsplit(".", 1)[-1] if "." in fn else ""
-        try:
-            if ext == "pdf":
-                t = pdf_text(p)
-                for fx, key in ((gstr3b, "g3"), (gstr1, "g1")):
-                    r = fx(t)
-                    if r:
-                        F[key].append(r); log.append(("GSTR-" + r["kind"], fn, "%d-%02d taxable %s" % (r["ym"] + (r["taxable"],)))); break
-                else:
-                    if "Account Statement Report" in t or "Statement of Axis Bank" in t:
-                        a, tx = bank_pdf(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); F["bank_name"][a] = F["bank_name"].get(a) or bank_of(t); log.append(("Bank PDF", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
-                    elif stock_statement(t):
-                        r = stock_statement(t); F["ss"].append(r); log.append(("Stock statement", fn, "%s stock %s" % (r["date"], r["stock"])))
-                    elif company_stock_statement(t):
-                        r = company_stock_statement(t); F["ss"].append(r)
-                        log.append(("Stock statement", fn, "%s stock %s lakh (company format, text looks OCR'd - check)" % (r["date"], r["stock"])))
-                    elif tally_pdf_kind(t):
-                        k = tally_pdf_kind(t)
-                        if k in ("Sundry Debtors", "Sundry Creditors"):
-                            cred = k == "Sundry Creditors"
-                            n = tally_pdf_names(t); F["creditors" if cred else "debtors"].update(n)
-                            tt = tally_pdf_totals(t, cred); F["cred_tot" if cred else "deb_tot"].extend(tt)
-                            if re.search(r"as\s*on", fn, re.I) and len(tt) == 1:     # 'Debtors as on 30-09-2025.pdf'
-                                F.setdefault("points", set()).add(tt[0]["date"])     # a position taken for the audit
-                            log.append(("Creditor ledger" if cred else "Debtor ledger", fn, "%d names (PDF)%s" % (len(n), (
-                                "; closing %s" % ", ".join("%s %.2f lakh" % (x["date"].strftime("%d-%m-%Y"), (x["cr"] if cred else x["dr"] - x["cr"]) / 1e5)
-                                                           for x in tt[-3:])) if tt else "")))
-                        elif k == "StockMonthly":
-                            rs = tally_pdf_stock_monthly(t)
-                            F["book"].extend(rs)
-                            log.append(("Book stock" if rs else "skipped", fn, "; ".join("%s %s lakh" % (r["date"], r["stock"]) for r in rs) + " (monthly summary PDF)" if rs else "monthly stock summary without figures"))
-                        elif k == "Stock":
-                            rs = tally_pdf_stocks(t)
-                            if rs:
-                                F["book"].extend(rs); log.append(("Book stock", fn, "; ".join("%s %s lakh" % (r["date"], r["stock"]) for r in rs) + " (PDF)"))
-                            else:
-                                log.append(("skipped", fn, "stock summary without a grand total"))
-                        else:
-                            r = tally_pdf_sales(t) or {}; F.setdefault("sales", {}).update(r)
-                            log.append(("Books sales", fn, "%d months (PDF)" % len(r)))
-                    elif stock_month_table(t):
-                        r = stock_month_table(t); F["book"].extend(r)
-                        log.append(("Book stock", fn, "%d month-ends from a monthly stock table (PDF)" % len(r)))
-                    elif re.search(r"1ST CHG ON IMMOVABLE PROP", t, re.I):
-                        v = [num(x) for x in re.findall(r"1ST CHG ON IMMOVABLE PROP[^\n|]*?(\d{5,})", t, re.I)]
-                        F["collateral"] = dict(value=sum(v), count=len(v))
-                        log.append(("Collateral", fn, "%d properties, insured value %s (bank's list)" % (len(v), sum(v))))
-                    elif pf_receipt(t):
-                        r = pf_receipt(t); F["pf"].append(r); log.append(("PF", fn, "%d-%02d Rs %s paid %s" % (r["ym"] + (r["amount"], r["paid"]))))
-                    elif esic_receipt(t):
-                        r = esic_receipt(t); F["esic"].append(r); log.append(("ESIC", fn, "%d-%02d Rs %s paid %s" % (r["ym"] + (r["amount"], r["paid"]))))
-                    elif gst_challan(t):
-                        r = gst_challan(t)
-                        if r["cpin"] in {x["cpin"] for x in F["challan"]}:
-                            log.append(("GST challan", fn, "CPIN %s already read from another file - counted once" % r["cpin"]))
-                        else:
-                            F["challan"].append(r); log.append(("GST challan", fn, "Rs %s deposited %s" % (r["amount"], r["paid"])))
-                    elif elec_bill_issue(t):
-                        r = elec_bill_issue(t)
-                        if not any(x["ym"] == r["ym"] for x in F["elec_ai"]):
-                            F["elec_ai"].append(r)
-                        log.append(("Electricity bill", fn, "%d-%02d issued %s net payable %s" % (r["ym"] + (r["bill_date"], r["amount"]))))
-                    elif electricity_bill(t):
-                        r = electricity_bill(t); F["elec"].append(r)
-                        log.append(("Electricity bill", fn, "%d-%02d net payable %s; previous month paid %s on %s" % (r["ym"] + (r["net"], r["prev_amount"], r["prev_paid"]))))
-                    elif policy(t, fn):
-                        r = policy(t, fn); F["policies"].append(r); F["names"].add(r["insured"])
-                        log.append(("Policy " + r["cls"], fn, "%s %s-%s stock SI %s" % (r["no"], r["frm"], r["to"], r["stock"])))
-                    elif sanction_letter(t):
-                        r = sanction_letter(t); F.setdefault("sanction", []).append(dict(bank=letter_bank(t), fac=r, file=fn))
-                        log.append(("Sanction letter", fn, "; ".join("%s %s lakh" % x for x in r) + " - CHECK on the page"))
-                    elif re.search(r"Tax\s*Invoice|Invoice\s*No", t, re.I) and add_invoices(F, p, pdf_pages(p)):
-                        r = [x for x in F["inv"] if x["file"] == fn]
-                        log.append(("Invoice", fn, "%d invoice(s): %s" % (len(r), ", ".join(x["no"] or "page %d not readable" % x["page"] for x in r))))
-                    else:
-                        log.append(("skipped", fn, "not recognised" if t.strip() else "no text layer (scanned)"))
-            elif ext == "txt":
-                t = open(p, encoding="utf-8", errors="replace").read()
-                if "STATEMENT" in t and "BALANCE" in t:
-                    a, tx = bank_txt(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); F["bank_name"][a] = F["bank_name"].get(a) or bank_of(t)
-                    sc = re.search(r"SCHEME CODE:\s*(.+?)\s{2,}", t)
-                    if sc:
-                        F.setdefault("bank_scheme", {})[a] = sc.group(1).strip()
-                    log.append(("Bank TXT", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
-            elif ext in ("xlsx", "xlsm", "csv", "xls") and re.search(OUT_YES, fn, re.I) and not re.search(OUT_NO, fn, re.I) \
-                    and outward_file(F, p, log):
-                pass                                          # outward-supply data read for the GST summary
-            elif ext in ("xlsx", "xlsm", "csv"):
-                if ext == "csv":
-                    rows = [l.rstrip("\n").split(",") for l in open(p, encoding="utf-8", errors="replace")]
-                else:
-                    # classify from the first 200 rows; read the whole workbook only for a type that is used
-                    # (big sales registers / GST Excel downloads took 40-85 s each to read in full)
-                    top = xlsx_rows(p, 200)
-                    k0, h0 = tally_kind(top)
-                    if not (k0 or tally_sales(top, h0) or tally_purchase(top, h0) or mca_directors(top) or bank_table(top)[1]):
-                        log.append(("skipped", fn, "not recognised")); continue
-                    rows = xlsx_rows(p)
-                k, head = tally_kind(rows)
-                if k == "Stock Summary":
-                    r = tally_stock(rows, head)
-                    if r: F["book"].append(r); log.append(("Book stock", fn, "%s %s lakh" % (r["date"], r["stock"])))
-                elif k == "Sundry Debtors":
-                    F["debtors"].update(tally_names(rows)); log.append(("Debtor ledger", fn, "names read"))
-                    tt = tally_group_total(rows, head)
-                    if tt and tt["date"]: F["deb_tot"].append(tt)
-                    ag = ageing_rows(rows, head)
-                    if ag and ag["date"]:
-                        F.setdefault("ageing", []).append(ag)
-                        log.append(("Debtor ageing", fn, "%s: <90 %.2f lakh, >90 %.2f lakh" % (ag["date"], ag["lt90"] / 1e5, ag["gt90"] / 1e5)))
-                elif k == "Sundry Creditors":
-                    F["creditors"].update(tally_names(rows)); log.append(("Creditor ledger", fn, "names read"))
-                    tt = tally_group_total(rows, head)
-                    if tt and tt["date"]: F["cred_tot"].append(tt)
-                elif tally_purchase(rows, head):
-                    r = tally_purchase(rows, head); F.setdefault("purch", {}).update(r)
-                    log.append(("Books purchase", fn, "; ".join("%d-%02d %s" % (k + ("{:,.2f}".format(v),)) for k, v in r.items())))
-                elif tally_sales(rows, head):
-                    r = tally_sales(rows, head); F.setdefault("sales", {}).update(r)
-                    log.append(("Books sales", fn, "%d months (sales net of returns)" % len(r)))
-                elif mca_directors(rows):
-                    F["directors"] = mca_directors(rows); F["dins"] = mca_dins(rows); log.append(("MCA", fn, ", ".join(F["directors"])))
-                else:
-                    acc, tx = bank_table(rows)
-                    if tx:
-                        [x.update(src=fn) for x in tx]
-                        F["bank"].setdefault(acc or fn, []).extend(tx)
-                        F["bank_name"][acc or fn] = F["bank_name"].get(acc or fn) or bank_of(" ".join(str(c) for r in rows[:sheet_head(rows)] for c in r if c))
-                        log.append(("Bank sheet", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
-                    else:
-                        log.append(("skipped", fn, "not recognised"))
+        scan_file(F, p, log)
+    return scan_end(F, log)
+
+
+def scan_file(F, p, log):
+    fn = os.path.basename(p); ext = fn.lower().rsplit(".", 1)[-1] if "." in fn else ""
+    try:
+        if ext == "pdf":
+            t = pdf_text(p)
+            for fx, key in ((gstr3b, "g3"), (gstr1, "g1")):
+                r = fx(t)
+                if r:
+                    F[key].append(r); log.append(("GSTR-" + r["kind"], fn, "%d-%02d taxable %s" % (r["ym"] + (r["taxable"],)))); break
             else:
-                log.append(("skipped", fn, "type not used"))
-        except Exception as e:
-            log.append(("ERROR", fn, repr(e)[:120]))
+                if "Account Statement Report" in t or "Statement of Axis Bank" in t:
+                    a, tx = bank_pdf(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); F["bank_name"][a] = F["bank_name"].get(a) or bank_of(t); log.append(("Bank PDF", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
+                elif stock_statement(t):
+                    r = stock_statement(t); F["ss"].append(r); log.append(("Stock statement", fn, "%s stock %s" % (r["date"], r["stock"])))
+                elif company_stock_statement(t):
+                    r = company_stock_statement(t); F["ss"].append(r)
+                    log.append(("Stock statement", fn, "%s stock %s lakh (company format, text looks OCR'd - check)" % (r["date"], r["stock"])))
+                elif tally_pdf_kind(t):
+                    k = tally_pdf_kind(t)
+                    if k in ("Sundry Debtors", "Sundry Creditors"):
+                        cred = k == "Sundry Creditors"
+                        n = tally_pdf_names(t); F["creditors" if cred else "debtors"].update(n)
+                        tt = tally_pdf_totals(t, cred); F["cred_tot" if cred else "deb_tot"].extend(tt)
+                        if re.search(r"as\s*on", fn, re.I) and len(tt) == 1:     # 'Debtors as on 30-09-2025.pdf'
+                            F.setdefault("points", set()).add(tt[0]["date"])     # a position taken for the audit
+                        log.append(("Creditor ledger" if cred else "Debtor ledger", fn, "%d names (PDF)%s" % (len(n), (
+                            "; closing %s" % ", ".join("%s %.2f lakh" % (x["date"].strftime("%d-%m-%Y"), (x["cr"] if cred else x["dr"] - x["cr"]) / 1e5)
+                                                       for x in tt[-3:])) if tt else "")))
+                    elif k == "StockMonthly":
+                        rs = tally_pdf_stock_monthly(t)
+                        F["book"].extend(rs)
+                        log.append(("Book stock" if rs else "skipped", fn, "; ".join("%s %s lakh" % (r["date"], r["stock"]) for r in rs) + " (monthly summary PDF)" if rs else "monthly stock summary without figures"))
+                    elif k == "Stock":
+                        rs = tally_pdf_stocks(t)
+                        if rs:
+                            F["book"].extend(rs); log.append(("Book stock", fn, "; ".join("%s %s lakh" % (r["date"], r["stock"]) for r in rs) + " (PDF)"))
+                        else:
+                            log.append(("skipped", fn, "stock summary without a grand total"))
+                    else:
+                        r = tally_pdf_sales(t) or {}; F.setdefault("sales", {}).update(r)
+                        log.append(("Books sales", fn, "%d months (PDF)" % len(r)))
+                elif stock_month_table(t):
+                    r = stock_month_table(t); F["book"].extend(r)
+                    log.append(("Book stock", fn, "%d month-ends from a monthly stock table (PDF)" % len(r)))
+                elif re.search(r"1ST CHG ON IMMOVABLE PROP", t, re.I):
+                    v = [num(x) for x in re.findall(r"1ST CHG ON IMMOVABLE PROP[^\n|]*?(\d{5,})", t, re.I)]
+                    F["collateral"] = dict(value=sum(v), count=len(v))
+                    log.append(("Collateral", fn, "%d properties, insured value %s (bank's list)" % (len(v), sum(v))))
+                elif pf_receipt(t):
+                    r = pf_receipt(t); F["pf"].append(r); log.append(("PF", fn, "%d-%02d Rs %s paid %s" % (r["ym"] + (r["amount"], r["paid"]))))
+                elif esic_receipt(t):
+                    r = esic_receipt(t); F["esic"].append(r); log.append(("ESIC", fn, "%d-%02d Rs %s paid %s" % (r["ym"] + (r["amount"], r["paid"]))))
+                elif gst_challan(t):
+                    r = gst_challan(t)
+                    if r["cpin"] in {x["cpin"] for x in F["challan"]}:
+                        log.append(("GST challan", fn, "CPIN %s already read from another file - counted once" % r["cpin"]))
+                    else:
+                        F["challan"].append(r); log.append(("GST challan", fn, "Rs %s deposited %s" % (r["amount"], r["paid"])))
+                elif elec_bill_issue(t):
+                    r = elec_bill_issue(t)
+                    if not any(x["ym"] == r["ym"] for x in F["elec_ai"]):
+                        F["elec_ai"].append(r)
+                    log.append(("Electricity bill", fn, "%d-%02d issued %s net payable %s" % (r["ym"] + (r["bill_date"], r["amount"]))))
+                elif electricity_bill(t):
+                    r = electricity_bill(t); F["elec"].append(r)
+                    log.append(("Electricity bill", fn, "%d-%02d net payable %s; previous month paid %s on %s" % (r["ym"] + (r["net"], r["prev_amount"], r["prev_paid"]))))
+                elif policy(t, fn):
+                    r = policy(t, fn); F["policies"].append(r); F["names"].add(r["insured"])
+                    log.append(("Policy " + r["cls"], fn, "%s %s-%s stock SI %s" % (r["no"], r["frm"], r["to"], r["stock"])))
+                elif sanction_letter(t):
+                    r = sanction_letter(t); F.setdefault("sanction", []).append(dict(bank=letter_bank(t), fac=r, file=fn))
+                    log.append(("Sanction letter", fn, "; ".join("%s %s lakh" % x for x in r) + " - CHECK on the page"))
+                elif re.search(r"Tax\s*Invoice|Invoice\s*No", t, re.I) and add_invoices(F, p, pdf_pages(p)):
+                    r = [x for x in F["inv"] if x["file"] == fn]
+                    log.append(("Invoice", fn, "%d invoice(s): %s" % (len(r), ", ".join(x["no"] or "page %d not readable" % x["page"] for x in r))))
+                else:
+                    log.append(("skipped", fn, "not recognised" if t.strip() else "no text layer (scanned)"))
+        elif ext == "txt":
+            t = open(p, encoding="utf-8", errors="replace").read()
+            if "STATEMENT" in t and "BALANCE" in t:
+                a, tx = bank_txt(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); F["bank_name"][a] = F["bank_name"].get(a) or bank_of(t)
+                sc = re.search(r"SCHEME CODE:\s*(.+?)\s{2,}", t)
+                if sc:
+                    F.setdefault("bank_scheme", {})[a] = sc.group(1).strip()
+                log.append(("Bank TXT", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
+        elif ext in ("xlsx", "xlsm", "csv", "xls") and re.search(OUT_YES, fn, re.I) and not re.search(OUT_NO, fn, re.I) \
+                and outward_file(F, p, log):
+            pass                                          # outward-supply data read for the GST summary
+        elif ext in ("xlsx", "xlsm", "csv"):
+            if ext == "csv":
+                rows = [l.rstrip("\n").split(",") for l in open(p, encoding="utf-8", errors="replace")]
+            else:
+                # classify from the first 200 rows; read the whole workbook only for a type that is used
+                # (big sales registers / GST Excel downloads took 40-85 s each to read in full)
+                top = xlsx_rows(p, 200)
+                k0, h0 = tally_kind(top)
+                if not (k0 or tally_sales(top, h0) or tally_purchase(top, h0) or mca_directors(top) or bank_table(top)[1]):
+                    log.append(("skipped", fn, "not recognised")); return
+                rows = xlsx_rows(p)
+            k, head = tally_kind(rows)
+            if k == "Stock Summary":
+                r = tally_stock(rows, head)
+                if r: F["book"].append(r); log.append(("Book stock", fn, "%s %s lakh" % (r["date"], r["stock"])))
+            elif k == "Sundry Debtors":
+                F["debtors"].update(tally_names(rows)); log.append(("Debtor ledger", fn, "names read"))
+                tt = tally_group_total(rows, head)
+                if tt and tt["date"]: F["deb_tot"].append(tt)
+                ag = ageing_rows(rows, head)
+                if ag and ag["date"]:
+                    F.setdefault("ageing", []).append(ag)
+                    log.append(("Debtor ageing", fn, "%s: <90 %.2f lakh, >90 %.2f lakh" % (ag["date"], ag["lt90"] / 1e5, ag["gt90"] / 1e5)))
+            elif k == "Sundry Creditors":
+                F["creditors"].update(tally_names(rows)); log.append(("Creditor ledger", fn, "names read"))
+                tt = tally_group_total(rows, head)
+                if tt and tt["date"]: F["cred_tot"].append(tt)
+            elif tally_purchase(rows, head):
+                r = tally_purchase(rows, head); F.setdefault("purch", {}).update(r)
+                log.append(("Books purchase", fn, "; ".join("%d-%02d %s" % (k + ("{:,.2f}".format(v),)) for k, v in r.items())))
+            elif tally_sales(rows, head):
+                r = tally_sales(rows, head); F.setdefault("sales", {}).update(r)
+                log.append(("Books sales", fn, "%d months (sales net of returns)" % len(r)))
+            elif mca_directors(rows):
+                F["directors"] = mca_directors(rows); F["dins"] = mca_dins(rows); log.append(("MCA", fn, ", ".join(F["directors"])))
+            else:
+                acc, tx = bank_table(rows)
+                if tx:
+                    [x.update(src=fn) for x in tx]
+                    F["bank"].setdefault(acc or fn, []).extend(tx)
+                    F["bank_name"][acc or fn] = F["bank_name"].get(acc or fn) or bank_of(" ".join(str(c) for r in rows[:sheet_head(rows)] for c in r if c))
+                    log.append(("Bank sheet", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
+                else:
+                    log.append(("skipped", fn, "not recognised"))
+        else:
+            log.append(("skipped", fn, "type not used"))
+    except Exception as e:
+        log.append(("ERROR", fn, repr(e)[:120]))
+
+
+def scan_end(F, log):
     # a sheet without an account number whose rows are the same as a real account's (e.g. a working copy such as
     # Summation.xlsx) is merged into that account - otherwise its credits would be counted twice
     accts = [k for k in F["bank"] if re.fullmatch(r"\d{9,}", k)]
@@ -2861,6 +2874,22 @@ def browser_scan(root):
     log = []
     F = scan(paths, log)
     _B.clear(); _B.update(F=F, log=log, paths=paths)
+    return browser_summary()
+
+
+def browser_scan_begin(root):
+    """Step-by-step reading for the browser (the page stays responsive): list the files, start empty data."""
+    paths = sorted(os.path.join(r, f) for r, _, fs in os.walk(root) for f in fs)
+    _B.clear(); _B.update(F=scan_new(), log=[], paths=paths)
+    return json.dumps(paths)
+
+
+def browser_scan_step(path):
+    scan_file(_B["F"], path, _B["log"])
+
+
+def browser_scan_end():
+    scan_end(_B["F"], _B["log"])
     return browser_summary()
 
 
