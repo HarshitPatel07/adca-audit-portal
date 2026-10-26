@@ -25,10 +25,14 @@ def scan(W):
 
 
 def recalc(p):
-    subprocess.run(["powershell", "-NoProfile", "-Command",
-                    "$x=New-Object -ComObject Excel.Application; $x.DisplayAlerts=$false; $w=$x.Workbooks.Open('%s'); "
-                    "$x.CalculateFull(); $w.Save(); $w.Close(); $x.Quit()" % os.path.abspath(p).replace("'", "''")],
-                   capture_output=True, timeout=300)
+    """Full recalculation in Excel (Windows + Excel only); elsewhere the formulas calculate when the file is opened."""
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command",
+                        "$x=New-Object -ComObject Excel.Application; $x.DisplayAlerts=$false; $w=$x.Workbooks.Open('%s'); "
+                        "$x.CalculateFull(); $w.Save(); $w.Close(); $x.Quit()" % os.path.abspath(p).replace("'", "''")],
+                       capture_output=True, timeout=300)
+    except Exception as e:
+        print("(no Excel here - recalculation skipped: %s; the score counts typed figures only)" % e)
 
 
 def score(P, R):

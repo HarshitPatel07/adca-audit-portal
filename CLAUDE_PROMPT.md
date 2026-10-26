@@ -1,44 +1,82 @@
-Make the stock-audit Excel for this borrower: <BORROWER FOLDER>  (it holds Working\ and Draft\ / WORKING\ and DRAFTING\)
+# ADCA stock-audit Excel — one prompt for any new chat
 
-You are the reader for what fixed rules cannot read. The rules (docs/core.py, the same engine as the live portal) read every
-digital file; you read the scans and fill claude_facts.json; the script joins both and writes the firm's 9-sheet Excel.
-Do not ask me questions. No document = blank cell (one line at the end saying which, no questions).
+Copy everything between the lines into a new chat and replace `<BORROWER FOLDER>`.
 
-RULES
-1. Source = Working\ only. NEVER copy a figure from the firm's draft. The draft is opened only at the end, for scoring.
-2. Read the page itself (render it to an image) for every value you enter. Copy figures exactly; never compute or round,
-   except unit conversion, and say which in "_sources".
-3. Lakh = Rs / 1,00,000. Audited statements: read the unit in the heading ("Rupees in Hundreds" -> lakh = /1000;
-   "Rs in Million" -> x10). Check the earlier year's column against the earlier year's own report.
-4. Aadhaar / ID cards: never use a number from them.
+---
 
-STEPS
-1. python C:\Harshit\adca-audit-portal\claude_run.py scan "<folder>\Working"
-   -> what the rules read, the portal prefill (borrower, GSTIN, directors, period) and the files NOT read.
-2. For each file not read, render the pages and read them. Fill <folder>\Draft\claude_facts.json:
-   form.own / gstin / related   : prefill (related = MCA directors + related parties of the audited accounts)
-   form.banks                   : "Bank, DP limit, facility" - the limit the DP is capped at (latest sanction letter;
-                                  check its date; sub-limits named as such). A second bank on its own line (pari passu).
-   form.fac                     : other facilities "name, limit, O/s on base date, O/s on visit date" - O/s from the bank
-                                  balance confirmations of those dates.
-   form.annual                  : "stock, sales, debtors, creditors, purchases; same for the year before" (audited, lakh):
-                                  inventories, revenue from operations, trade receivables, trade payables, purchases.
-   form.extra                   : "dd-mm-yyyy, Visit date dd-mm-yyyy, visit-date book stock (lakh)".
-   form.inv                     : the rule-read invoice rows by id ("<file>#<page>"): no, date, party, item, uom, qty, rate,
-                                  kind (sales / purchase) - 3 sales + 3 purchases, corrected from the scan.
-   form.pol                     : {"<policy no>": {"si": stock SI lakh, "fl": first-loss %}} only where the rules left it blank.
-   form.pm / coll               : P&M value and collateral value (lakh) if a document gives them.
-   books                        : scanned Tally books of the visit date: date, stock_rs, debtors_rs, creditors_rs (credit
-                                  balances only), debtor_parties [[name, Rs]], creditor_parties.
-   ai                           : {"<file>": AI_PROMPT json} for scanned stock statements / challans / bills the rules missed
-                                  (docs/core.py AI_PROMPT; stock statements: stock_date, stock_lakh, creditors_lakh,
-                                  debtors_lakh, debtors_over_lakh).
-   Leave from / to empty: the rules set the period (ends at the latest stock statement, books and bank permitting).
-3. python claude_run.py make "<folder>\Working" "<folder>\Draft\claude_facts.json" "<folder>\Draft\<BORROWER>_CLAUDE.xlsx" "<folder>\Draft\<draft>.xlsx"
-   -> Excel written, recalculated in Excel, scored against the draft (same cell / found anywhere / input figures).
-4. Check: no #REF! / #VALUE!; DP columns = SS / books of the base date / visit date; 5 random figures traced to the page.
-5. Every remaining gap: draft error (prove it from the source), layout difference, typed-only item, or a rule gap ->
-   fix the rule in docs/core.py, re-run the borrower, and re-run Gold Star (must stay at 80% same cell).
+Make the ADCA stock-audit Excel (the firm's 9-sheet workbook: Facility sanctioned, DP calculation, Stock Holding,
+Debtors Holding, Creditors Holding, Invoice, summation, Insurance, GST) for this borrower: <BORROWER FOLDER>
+(the folder holds Working\ — the raw documents — and usually Draft\ with the firm's own Excel).
 
-REPORT (short): file path; accuracy (cells same / found, inputs same / found); what you read and from which page;
-rule gaps fixed; draft errors; one line of blanks.
+Do not ask me questions. Generate from what is in the folder; a figure with no document stays blank, listed once at the end.
+
+## The engine
+Rules engine and template: public repo https://github.com/HarshitPatel07/adca-audit-portal (docs/core.py = all rules,
+docs/template.xlsx = the firm's blank layout, claude_run.py = the runner). Same engine as the live portal
+https://harshitpatel07.github.io/adca-audit-portal/ . The rules read every digital file (bank statements, GSTR-3B/1, Tally
+books, stock statements, policies, challans). YOU read what the rules cannot: scans, sanction letters, audited balance
+sheets, visit-date books, invoices.
+
+## Which way to work
+- **You can run commands (Claude Code / any agent with a shell):** use the engine — steps A.
+- **Plain chat with uploaded files (no shell):** read the uploaded scans and give me the check-page entries for the live
+  portal — steps B.
+
+## Rules (never break)
+1. Source = Working\ only. NEVER take a figure from the firm's draft Excel; open it only at the end, to score.
+2. Read every value from the page itself (render scans to images and look). Copy exactly; never estimate, round or compute,
+   except unit conversion (say which).
+3. Lakh = Rs / 1,00,000. Audited statements: read the unit in the heading ("Rupees in Hundreds" → lakh = ÷1000,
+   "Rs in Million" → ×10). Check the earlier year's column against the earlier year's own report.
+4. Sanction limits from the LATEST sanction letter (check its date); sub-limits named as sub-limits.
+5. Outstanding balances from the bank balance confirmation of that date.
+6. Never use Aadhaar / ID-card numbers.
+
+## A. With a shell
+1. Get the engine (once): `git clone https://github.com/HarshitPatel07/adca-audit-portal` (or `git pull` if present;
+   on the ADCA PC it is C:\Harshit\adca-audit-portal) and `pip install pymupdf openpyxl xlrd`.
+   Optional: Tesseract OCR (C:\Program Files\Tesseract-OCR) for scanned statements / invoices; Excel (Windows) for recalculation.
+2. `python claude_run.py scan "<folder>\Working"` — shows what the rules read, the prefill (borrower, GSTIN, directors,
+   period) and the files NOT read. List every file in Working\ yourself too; do not trust a partial listing.
+3. Read each unread file and write `<folder>\Draft\claude_facts.json`:
+```json
+{
+  "_sources": {"banks/fac": "file + page", "annual": "file + page + unit", "extra/books": "...", "inv": "..."},
+  "form": {
+    "own": "BORROWER NAME", "gstin": "GSTIN", "related": "director 1\ndirector 2 (MCA directors + related parties)",
+    "banks": "Axis Bank, <DP limit lakh>, <facility>   (second bank on a new line if pari passu)",
+    "fac": "<facility>, <limit>, <O/s on base date>, <O/s on visit date>   (one per line, lakh)",
+    "annual": "stock, sales, debtors, creditors, purchases; same five for the year before   (audited, lakh)",
+    "extra": "dd-mm-yyyy, Visit date dd-mm-yyyy, <visit-date book stock lakh>",
+    "inv": {"<file>#<page>": {"no": "", "date": "dd-mm-yyyy", "party": "", "item": "", "uom": "", "qty": "", "rate": "", "kind": "sales|purchase"}},
+    "pol": {"<policy no>": {"si": "<stock SI lakh>", "fl": "<first loss %>"}},
+    "pm": "", "coll": "", "from": "", "to": ""
+  },
+  "books": [{"file": "", "date": "dd-mm-yyyy", "stock_rs": 0, "debtors_rs": 0, "creditors_rs": 0,
+             "debtor_parties": [["name", 0]], "creditor_parties": [["name", 0]]}],
+  "ai": {"<scanned file name>": {"doc_type": "stock_statement", "entries": [{"page": 1, "stock_date": "dd-mm-yyyy",
+          "stock_lakh": 0, "creditors_lakh": 0, "debtors_lakh": 0, "debtors_over_lakh": 0}]}}
+}
+```
+   - `inv` ids are the rows the rules made from the invoice scans (shown by the runner); give 3 sales + 3 purchases.
+   - `books` = scanned Tally books of the visit date (creditors = credit balances only).
+   - `ai` = scanned stock statements / challans / bills the rules missed (fields as in AI_PROMPT in docs/core.py).
+   - Leave from / to empty: the rules choose the period. Leave pol / pm / coll empty if no document gives them.
+4. `python claude_run.py make "<folder>\Working" "<folder>\Draft\claude_facts.json" "<folder>\Draft\<BORROWER>_CLAUDE.xlsx" "<firm's draft .xlsx>"`
+   → Excel written, recalculated, and scored (same cell / found anywhere / input figures) if the draft is given.
+5. Check: no #REF! / #VALUE!; DP columns = stock statement, books of the base date, visit date; trace 5 random figures to the page.
+6. For each remaining difference decide: draft error (prove it from the source), layout difference, figure typed only
+   by the auditor, or rule gap. A rule gap → fix docs/core.py, re-run this borrower and Gold Star (must stay ~80% same
+   cell), then commit and push (the live portal updates).
+
+## B. Plain chat (no shell)
+Read the files I upload and give me, ready to paste into the live portal's check page:
+Borrower, GSTIN, related parties, "Banks and sanctioned limits", "Other facilities", "Audited years",
+"Visit date / visit stock", invoice corrections (3 sales + 3 purchase), stock SI per policy, P&M and collateral values —
+each with the file and page it came from. Then I upload the Working folder on the portal and press Make Excel.
+
+## Report back (short)
+File path · accuracy vs the firm's draft (cells same / found, input figures same / found) · what you read and from which
+page · rule gaps fixed · draft errors found · one line of blanks (no questions).
+
+---
