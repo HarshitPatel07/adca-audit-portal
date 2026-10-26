@@ -610,6 +610,27 @@ def tally_sales(rows, head):
     return out or None
 
 
+def tally_parties(rows):
+    """Party rows of a Tally group summary with Debit / Credit closing columns: [(name, debit, credit)] (Rs).
+    A supplier with a DEBIT balance is an advance, not a creditor (Gold Star Sevenstar Polytex 79,39,818 Dr)."""
+    di = ci = None
+    for i, r in enumerate(rows[:20]):
+        low = [str(c or "").strip().lower() for c in r]
+        if "debit" in low and "credit" in low:
+            di, ci, start = low.index("debit"), low.index("credit"), i + 1
+    if di is None:
+        return []
+    out = []
+    for r in rows[start:]:
+        n = str(r[0] or "").strip()
+        if not n or n.lower().startswith(("grand total", "total")):
+            continue
+        g = lambda j: float(r[j]) if j < len(r) and isinstance(r[j], (int, float)) else 0.0
+        if g(di) or g(ci):
+            out.append((n, g(di), g(ci)))
+    return out
+
+
 def tally_purchase(rows, head):
     """Tally 'Purchase Accounts' group summary of ONE month ('1-Oct-25 to 31-Oct-25'): {(y, m): Grand Total Rs}
     (Gold Star Oct-25 18,147,329.12 = the draft's purchase column)."""
@@ -1335,6 +1356,19 @@ def _uom(u):
     return "Pcs" if u == "Pes" else u          # OCR reads 'pcs' as 'pes'; the qty x rate proof still applies
 
 
+def _inv_total(f):
+    """Invoice value = the last amount on the invoice's 'Total' line (Magnum: 'Total - [5,000 kg 9,44,000.000'),
+    never the largest number on the page (that is often a bank account / Ack number)."""
+    best = None
+    for line in f.split("\n"):
+        if re.search(r"\bTotal\b", line, re.I) and not re.search(r"in words|Tax Amount|Taxable|CGST|SGST|IGST", line, re.I):
+            vals = [num(x) for x in re.findall(r"\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d+\.\d{2,3}", line)]
+            vals = [v for v in vals if 100 <= v < 1e9]
+            if vals:
+                best = max(best or 0, vals[-1])
+    return best
+
+
 def invoice_page(t, own_names=(), kind_hint=""):
     """One tax-invoice page -> dict(no, date, party, item, uom, qty, rate) or None.
     Text-layer Tally PDFs print the item row reversed ('1 Item | Amount | per | Rate | Qty UNIT'); OCR keeps reading order.
@@ -1409,7 +1443,7 @@ def invoice_page(t, own_names=(), kind_hint=""):
     bg = re.search(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z])\b", f[bpos:]) if bpos >= 0 else None
     x = dict(unread=not best, hint=kind_hint, cos=cos[:6], buyer=buyer.group(1).strip(" |") if buyer else "",
              seller_gstin=gstins[0] if gstins else "", buyer_gstin=bg.group(1) if bg else "",
-             total=max(amounts) if amounts else None, no=no or "", date=d(dte) if dte else None, item=item,
+             total=_inv_total(f), no=no or "", date=d(dte) if dte else None, item=item,
              uom=best[1] if best else "", qty=best[0] if best else None, rate=best[2] if best else None)
     x["party"] = x["buyer"] or (cos[0] if cos else "")          # provisional (page grouping); final in inv_resolve
     return x
@@ -1637,6 +1671,9 @@ def scan_file(F, p, log):
                 F["creditors"].update(tally_names(rows)); log.append(("Creditor ledger", fn, "names read"))
                 tt = tally_group_total(rows, head)
                 if tt and tt["date"]: F["cred_tot"].append(tt)
+                pc = tally_parties(rows)
+                if pc and tally_end(head):
+                    F.setdefault("cred_parties", {})[tally_end(head)] = [(n, c) for n, d_, c in pc if c > 0]
             elif tally_purchase(rows, head):
                 r = tally_purchase(rows, head); F.setdefault("purch", {}).update(r)
                 log.append(("Books purchase", fn, "; ".join("%d-%02d %s" % (k + ("{:,.2f}".format(v),)) for k, v in r.items())))
@@ -2898,17 +2935,44 @@ def fw_debtors(ws, F, cfg, X, P, so):
     # their debtor balance (ageing of the same day), PAN = GSTIN characters 3-12 where the invoice prints it
     inv_resolve(F, list(cfg["own"]) + sorted(F["names"]), cfg.get("gstin") or "")
     bal = {nospace(nm.upper())[:12]: lt + gt for nm, lt, gt in (ag["parties"] if ag else [])}
+    cp = (F.get("cred_parties") or {})
+    cbal = {nospace(nm.upper())[:12]: c for nm, c in cp.get(day) or cp.get(X["visit"]) or cp.get(X["base"]) or []}
     r = k0 + 2
     for kind, lab in (("sales", "SALES"), ("purchase", "PURCHASE")):
         rows = []
-        for x in pick_invoices(F, kind):
+        if kind == "purchase":
+            # every purchase-invoice supplier once, in page order - unread / OCR pages too; an OCR-garbled name
+            # ('Shreo Ganesh', 'i Packaging it Ld') is taken from the creditors list when it is clearly the same party
+            import difflib
+            cnames = [nm for nm, _ in (cp.get(day) or cp.get(X["visit"]) or cp.get(X["base"]) or [])]
+            seen, plist = set(), []
+            for x in sorted([x for x in F.get("inv", []) if x.get("kind") == "purchase"], key=lambda x: (x["file"].lower(), x["page"])):
+                nm = _clean_party(x.get("party") or "")
+                words = lambda s: [w for w in re.findall(r"[A-Z]{5,}", s.upper()) if w not in ("PRIVATE", "LIMITED", "PURCHASE")]
+                # same party only when a real word of the name matches (GANESH, PACKAGING) - 'Polytex' is not 'Polysure'
+                tie = lambda c: any(difflib.SequenceMatcher(None, a, b).ratio() >= 0.8 for a in words(nm) for b in words(c))
+                cands = [c for c in cnames if tie(c)]
+                best = max(cands, key=lambda c: difflib.SequenceMatcher(None, nm.upper(), c.upper()).ratio(), default=None)
+                if best and difflib.SequenceMatcher(None, nm.upper(), best.upper()).ratio() >= 0.5:
+                    nm = re.sub(r"\s*\((?:Purchase|Purchases)\)\s*$", "", best)
+                elif not nm or _looks_garbled(nm):
+                    continue
+                k_ = nospace(nm.upper())[:10]
+                if k_ in seen:
+                    continue
+                seen.add(k_); y = dict(x); y["party"] = nm; y["unread"] = False; plist.append(y)
+        for x in (plist if kind == "purchase" else pick_invoices(F, kind)):
             if x["unread"] or not x.get("party"):
                 continue
             # PAN = GSTIN characters 3-12: the supplier's on a purchase, the buyer's on a sale
             pan = ((x["seller_gstin"] if kind == "purchase" else x.get("buyer_gstin")) or "")[2:12]
-            # buyers: their debtor balance; suppliers: the invoice value (Gold Star Magnum 9,44,000 -> 9.44)
-            amt = bal.get(nospace(x["party"].upper())[:12]) if kind == "sales" else x.get("total")
-            rows.append((x["party"], pan or None, lab, amt / 1e5 if amt else None))
+            if pan and pan == (cfg.get("gstin") or "")[2:12]:
+                pan = ""                                  # the borrower's own PAN is never a party's PAN
+            # buyers: their debtor balance; suppliers: their CREDITOR balance on the same day (Gold Star Magnum 9,44,000
+            # -> 9.44; Sevenstar has a debit balance = an advance -> 0), as the drafts do
+            amt = bal.get(nospace(x["party"].upper())[:12]) if kind == "sales" else \
+                (cbal.get(nospace(x["party"].upper())[:12], 0.0) if cbal else None)
+            rows.append((x["party"], pan or None, lab, amt / 1e5 if amt is not None else None))
         for row in rows:                                              # invoice order, as the drafts list them
             ws["B%d" % r], ws["C%d" % r], ws["D%d" % r], ws["E%d" % r] = row
             r += 1
@@ -2946,6 +3010,17 @@ def fw_creditors(ws, F, cfg, X, P):
         ws.merge_cells(start_row=R(13), start_column=3, end_row=R(13) + n - 1, end_column=3)
     c0 = max(R(19), R(13) + n + 3)
     ws["C%d" % c0], ws["D%d" % c0], ws["E%d" % c0] = "Name of The Creditor", "O/S", "Share (%)"
+    # creditors of 5% or more on the visit date (credit balances only), amounts in Rs as the drafts write them
+    day = X["visit"] if X["visit"] in (F.get("cred_parties") or {}) else X["base"]
+    cp = (F.get("cred_parties") or {}).get(day) or []
+    tot = sum(c for _, c in cp)
+    big = sorted([(nm, c) for nm, c in cp if tot and c >= 0.05 * tot], key=lambda x: -x[1])
+    for k, (nm, c) in enumerate(big):
+        r = c0 + 1 + k
+        ws["C%d" % r], ws["D%d" % r], ws["E%d" % r] = re.sub(r"\s*\((?:Purchase|Purchases)\)\s*$", "", nm), c, "=D%d/$D$%d" % (r, c0 + 1 + len(big))
+    if big:
+        r = c0 + 1 + len(big)
+        ws["C%d" % r], ws["D%d" % r], ws["E%d" % r] = "Total", tot, "=SUM(E%d:E%d)" % (c0 + 1, r - 1)
 
 
 def build_excel_draft(F, cfg, out):
