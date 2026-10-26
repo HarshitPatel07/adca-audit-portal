@@ -58,6 +58,12 @@ sheets, visit-date books, invoices.
           "stock_lakh": 0, "creditors_lakh": 0, "debtors_lakh": 0, "debtors_over_lakh": 0}]}}
 }
 ```
+   - `related`: add every person / firm in the tax audit's 40A(2)(b) list (Form 3CD; a screenshot like RPT.PNG) with
+     " (40A)" after the name — their credits are excluded from the summation like a director's. Trading sister concerns
+     WITHOUT the tag stay in (they are trade receipts).
+   - `banks` / `fac`: write "(sub-limit)" in the name of every facility the letter calls a sub-limit — it is shown as a
+     negative limit and left out of Total Exposure; the DP's "Limit Utilised" adds the O/s of all working-capital
+     facilities (CC, EPC/PCFC, PSC, WCDL, OD), never term loans / GECL / BG / LC / LER.
    - `inv` ids are the rows the rules made from the invoice scans (shown by the runner); give 3 sales + 3 purchases.
    - `books` = scanned Tally books of the visit date (creditors = credit balances only).
    - `ai` = scanned stock statements / challans / bills the rules missed (fields as in AI_PROMPT in docs/core.py).
@@ -68,6 +74,17 @@ sheets, visit-date books, invoices.
 6. For each remaining difference decide: draft error (prove it from the source), layout difference, figure typed only
    by the auditor, or rule gap. A rule gap → fix docs/core.py, re-run this borrower and Gold Star (must stay ~80% same
    cell), then commit and push (the live portal updates).
+
+## Firm conventions the engine applies (learned from all six original drafts — keep them)
+- One bank: no second-bank / proportionate-DP rows in the DP and summation sheets; Eligible DP = MIN(limit, total DP);
+  realization % = receipts ÷ sales realization.
+- Monthly stock statements: 12 month rows in the holding sheets, two audited-year rows (latest audited year = last 31 March
+  at least 6 months before the stock date, and the year before). Period ends at the latest stock statement.
+- Variance % = (stock statement − books) ÷ stock statement, on debtors and creditors. No GSTR-2B → "Not provided by the borrower".
+- No burglary policy: one "Insured Amt (Fire & Burglary)" column, month table right under the fire policy.
+- Inventory details = the field app's "PV Sheet" CSV (item, qty, rate) in PV & Checklist\, else visit-date book items.
+- A borrower's own summation workbook in Working\ (SUBTOTAL over a filtered sheet) shows which credits the auditor excluded —
+  learn the exclusion from its hidden rows, but take amounts from the bank statement (Baid's had 6 corrupt rows).
 
 ## B. Plain chat (no shell)
 Read the files I upload and give me, ready to paste into the live portal's check page:

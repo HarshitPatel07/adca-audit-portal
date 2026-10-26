@@ -1558,6 +1558,31 @@ def pick_invoices(F, kind, n=3):
     return out
 
 
+def pv_sheet(p):
+    """Field-app annexure CSV ('PV Sheet': SR NO, ITEM, Qty, UOM, Rate, Amount) = the auditor's physical verification:
+    [(item, qty, uom, rate)] - the 'Inventory Details' table of Stock Holding (Baid: Till Oil 195721 Kg @ 142)."""
+    import csv
+    try:
+        rows = list(csv.reader(open(p, encoding="utf-8-sig", errors="replace")))
+    except Exception:
+        return None
+    if not rows or not any(r and r[0].strip().lower() == "pv sheet" for r in rows[:3]):
+        return None
+    out, on = [], False
+    for r in rows:
+        low = [c.strip().lower() for c in r]
+        if low[:2] == ["sr no", "item"]:
+            on = True; continue
+        if on:
+            if not any(low):
+                break
+            try:
+                out.append((r[1].strip(), float(r[2]), r[3].strip(), float(r[4])))
+            except (ValueError, IndexError):
+                continue
+    return out or None
+
+
 # ---------------- scan everything ----------------
 def scan_new():
     return dict(bank={}, bank_name={}, inv=[], g1=[], g3=[], ss=[], book=[], debtors=set(), creditors=set(), directors=[], policies=[], names=set(),
@@ -1666,6 +1691,10 @@ def scan_file(F, p, log):
         elif ext in ("xlsx", "xlsm", "csv"):
             if ext == "csv":
                 rows = [l.rstrip("\n").split(",") for l in open(p, encoding="utf-8", errors="replace")]
+                pv = pv_sheet(p)
+                if pv:
+                    F["pv"] = pv; log.append(("Physical verification", fn, "; ".join("%s %s %s @ %s" % x for x in pv)))
+                    return
             else:
                 od = debtor_od(p) if re.search(r"debtor|\bOD\b|outstanding", fn, re.I) else None
                 if od:                                        # company debtors ageing workbook (bill-wise)
@@ -2270,7 +2299,9 @@ def draft_summation(ws, F, cfg, allc):
     bank1 = banks[0][0] if banks and banks[0][0] else ((F.get("bank_name") or {}).get(cc) or "Bank")
     ods = sorted([a for a, tx in accs if a != cc and _is_cc(dedupe(tx))],   # more overdrawn accounts (Bhawani: 2 OD),
                  key=lambda a: min(t.get("src", "") for t in F["bank"][a]))  # in file order as the draft lists them
-    ca = next((a for a, tx in accs if a != cc and a not in ods), None)
+    # the second block is a CURRENT account; a cash-credit sub-limit account (Baid ...2902) is not shown, as in the draft
+    ca = next((a for a, tx in accs if a != cc and a not in ods
+               and not re.search(r"CASH CREDIT", (F.get("bank_scheme") or {}).get(a, ""))), None)
     inp = lambda t: start <= (t["date"].year, t["date"].month) <= base
     def lab(acc, dflt):                                 # 'CASH CREDIT SME PLUS' -> 'Cash Credit'; else the scheme as printed
         sc = (F.get("bank_scheme") or {}).get(acc, "")
@@ -2286,6 +2317,9 @@ def draft_summation(ws, F, cfg, allc):
         dirs = [x.upper() for x in F.get("directors", [])]
         is_dir = lambda r: r["why"].startswith("Promoter-director") or any(
             r["why"].upper().startswith("RELATED PARTY / DIRECTOR: " + x) for x in dirs)
+        # related persons of the tax audit's 40A(2)(b) list, marked '(40A)' on the check page, are excluded like directors
+        # (Baid: Sampat Lal Dharamchand, a firm where a director is partner - 38.94 lakh out in the draft's own working)
+        dirs += [x.upper() for x in cfg.get("related_excl", [])]
         ex = sum(r["amt"] for r in allc if r["acc"] == acc and inp(r) and
                  (r["cat"].startswith("Self-transfer") or (r["cat"].startswith("Director") and is_dir(r))))
         cr = sum(t["amt"] for t in tx if t["amt"] > 0) - ex
@@ -2345,6 +2379,10 @@ def draft_summation(ws, F, cfg, allc):
     ws["B%d" % R(20)] = "Routed In %s – CA" % sh1; ws["C%d" % R(20)] = "=H5" if ca else 0
     ws["B%d" % R(21)] = "Total Receipt In %s" % sh1; ws["C%d" % R(21)] = "=C%d+C%d" % (R(19), R(20))
     ws["B%d" % R(22)] = "Sales Realization in %"; ws["C%d" % R(22)] = "=IFERROR(C%d/C%d%%,\"\")" % (R(21), R(17))
+    if len(banks) < 2:
+        # one bank (Baid): no limit / proportionate rows - realization % = receipts / sales realization, as a fraction
+        ws["C%d" % R(22)] = "=IFERROR(C%d/C%d,\"\")" % (R(21), R(13))
+        _drop_rows(ws, R(14), 5)
 
 
 def _addr(a):
@@ -2469,6 +2507,13 @@ def draft_insurance(ws, F, cfg):
     cfg = dict(cfg, collateral_value=cv)
     if cfg.get("collateral_value") is not None and bld is not None:
         ws["E%d" % (32 + o)] = "Adequately Insured" if bld >= cfg["collateral_value"] else "Inadequately Insured"
+    if not burg:
+        # no burglary policy (Baid, Clan, Denis drafts): one 'Fire & Burglary' column, remarks beside it, and no empty
+        # burglary block - the month table starts 7 rows below the policy header (row 11)
+        ws["D20"], ws["E20"], ws["F20"] = "Insured Amt (Fire & Burglary)", "Remarks", None
+        for i in range(len(rows)):
+            ws["E%d" % (21 + i)], ws["F%d" % (21 + i)] = ws["F%d" % (21 + i)].value, None
+        _drop_rows(ws, 11, 9)
 
 
 GST_STATES = {"01": "Jammu and Kashmir", "02": "Himachal Pradesh", "03": "Punjab", "04": "Chandigarh", "05": "Uttarakhand",
@@ -2706,20 +2751,32 @@ def fw_facility(ws, F, cfg, X):
     bn = X["base"].strftime("%d-%m-%Y"); vn = X["visit"].strftime("%d-%m-%Y") if X["visit"] else ""
     ws["A2"], ws["B2"], ws["C2"], ws["E2"] = "Particulars", "Limits Sanctioned", "As on " + bn, ("As on " + vn) if vn else None
     ws["C3"], ws["D3"], ws["E3"], ws["F3"] = "DP", bank1, "DP", bank1
-    ws["A4"], ws["B4"] = (b1[2] if len(b1) > 2 and b1[2] else "Cash Credit"), b1[1]
+    # the firm's conventions (Baid): a sub-limit is shown as a NEGATIVE limit and left out of Total Exposure (EPC 1500 +
+    # LER 175 = the letter's 16.75 cr; CC -1500 and PSC -500 sit inside EPC); the DP's 'Limit Utilised' is the O/s of every
+    # working-capital facility under the DP limit (Baid CC + EPC 1473.41 on the visit date), never term loans / BG / LC / LER
+    sub = lambda nm: bool(re.search(r"sub[\s-]*limit", nm or "", re.I))
+    wc = lambda nm: not re.search(r"term|\btl\b|gecl|wctl|guarantee|\bbg\b|letter of credit|\blc\b|\bler\b|\bcel\b|forward|derivative", nm or "", re.I)
+    lim = lambda nm, v: -abs(v) if v is not None and sub(nm) else v
+    a4 = b1[2] if len(b1) > 2 and b1[2] else "Cash Credit"
+    ws["A4"], ws["B4"] = a4, lim(a4, b1[1])
     ws["C4"], ws["E4"] = "='DP calculation'!D21", "='DP calculation'!E21"
     ws["D4"] = X["L"](_bal_on(F, X["cc"], X["base"])) if X["cc"] else None
     ws["F4"] = X["L"](_bal_on(F, X["cc"], X["visit"])) if X["cc"] and X["visit"] else None
     extra = cfg.get("facilities") or []           # typed: name, limit, o/s on base date, o/s on visit date
     k = max(0, len(extra) - 1)
     _grow(ws, 6, k)                                 # more than one other facility (Bhawani: 10) -> rows added
+    X["wc_rows"] = [4]
     for i, f in enumerate(extra):
         r = 5 + i
-        ws["A%d" % r], ws["B%d" % r], ws["C%d" % r], ws["D%d" % r], ws["E%d" % r], ws["F%d" % r] = f[0], f[1], "NA", f[2], "NA", f[3]
+        ws["A%d" % r], ws["B%d" % r], ws["C%d" % r], ws["D%d" % r], ws["E%d" % r], ws["F%d" % r] = f[0], lim(f[0], f[1]), "NA", f[2], "NA", f[3]
+        if wc(f[0]):
+            X["wc_rows"].append(r)
     tr = 6 + k
     ws["A%d" % tr] = "Total Exposure"
-    for c in "BCDEF":
+    for c in "CDEF":
         ws["%s%d" % (c, tr)] = "=SUM(%s4:%s%d)" % (c, c, tr - 1)
+    main = [4 + i for i, nm in enumerate([a4] + [f[0] for f in extra]) if not sub(nm)]
+    ws["B%d" % tr] = "=SUM(B4:B%d)" % (tr - 1) if len(main) == len(extra) + 1 else "=" + "+".join("B%d" % r for r in main) if main else 0
     b2 = banks[1] if len(banks) > 1 else None
     ws["A%d" % (10 + k)], ws["B%d" % (10 + k)] = "Particulars(%s)" % (_short_bank(b2[0]) + " bank" if b2 else "other bank"), "Limits Sanctioned"
     if b2:
@@ -2762,10 +2819,10 @@ def fw_dp(ws, F, cfg, X):
         ws[c + "5"] = "=%s3-%s4" % (c, c); ws[c + "6"] = "=%s5*25%%" % c; ws[c + "7"] = "=%s5-%s6" % (c, c)
         ws[c + "11"] = "=%s9-%s10" % (c, c); ws[c + "12"] = "=%s11*25%%" % c; ws[c + "13"] = "=%s11-%s12" % (c, c)
         ws[c + "14"] = "=%s8-%s9" % (c, c); ws[c + "15"] = "=%s7+%s13" % (c, c)
-        ws[c + "16"] = "='Facility sanctioned'!B4"; ws[c + "17"] = "='Facility sanctioned'!B%d" % (12 + X.get("fk", 0)); ws[c + "18"] = "=%s16+%s17" % (c, c)
+        ws[c + "16"] = "=ABS('Facility sanctioned'!B4)"; ws[c + "17"] = "='Facility sanctioned'!B%d" % (12 + X.get("fk", 0)); ws[c + "18"] = "=%s16+%s17" % (c, c)
         ws[c + "19"] = "=IFERROR(%s15*%s16/%s18,%s15)" % (c, c, c, c); ws[c + "20"] = "=IFERROR(%s15*%s17/%s18,0)" % (c, c, c)
         ws[c + "21"] = '=IF(N(%s16)=0,%s19,MIN(%s16,%s19))' % (c, c, c, c)
-        ws[c + "22"] = "='Facility sanctioned'!$D$4" if c != "E" else "='Facility sanctioned'!F4"
+        ws[c + "22"] = "=" + "+".join("'Facility sanctioned'!%s%d" % ("F" if c == "E" else "D", r) for r in X.get("wc_rows", [4]))
         ws[c + "23"] = "=IF(N(%s22)>%s21,%s22-%s21,0)" % (c, c, c, c)
         ws[c + "24"] = '=IF(N(%s22)>%s21,IF(%s22<=%s16,"Over Utilised against DP but within the sanction limit","Over Utilised beyond the sanction limit"),"Regular")' % (c, c, c, c)
     if no_age:
@@ -2930,10 +2987,15 @@ def fw_stock(ws, F, cfg, X, P):
     for c, t in zip("ABCD", ["Inventory Details", "Quantity", "Rate", "Value in INR"]):
         ws["%s%d" % (c, R(12))] = t; ws["%s%d" % (c, R(21))] = t
     # six largest items of the visit-date book stock (Tally stock summary of that day), value = quantity x rate
+    # the auditor's physical verification sheet (field-app 'PV Sheet' CSV) first - it is what the drafts list, in both
+    # tables (Baid rows 23-26 and 32-35); else the visit-date book stock items
     vis = next((b for b in F["book"] if b.get("date") == X["visit"] and b.get("items")), None)
-    for k, (nm, q, rt, val) in enumerate(sorted(vis["items"], key=lambda x: -x[3])[:6] if vis else []):
-        r = R(13) + k
-        ws["A%d" % r], ws["B%d" % r], ws["C%d" % r], ws["D%d" % r] = nm, q, rt, "=B%d*C%d" % (r, r)
+    items = [(nm, q, rt) for nm, q, u, rt in F.get("pv") or []] or \
+            [(nm, q, rt) for nm, q, rt, val in (sorted(vis["items"], key=lambda x: -x[3])[:6] if vis else [])]
+    for k, (nm, q, rt) in enumerate(items[:6]):
+        for top in ((R(13), R(22)) if F.get("pv") else (R(13),)):
+            r = top + k
+            ws["A%d" % r], ws["B%d" % r], ws["C%d" % r], ws["D%d" % r] = nm, q, rt, "=B%d*C%d" % (r, r)
     vn = X["visit"].strftime("%d-%m-%Y") if X["visit"] else ""
     ws["A%d" % R(28)], ws["D%d" % R(28)] = "Total value of Stock physically verified on %s (Value Rs. in INR) " % vn, "=SUM(D%d:D%d)" % (R(22), R(27))
     ws["A%d" % R(29)], ws["D%d" % R(29)] = "Total value of Stock physically verified on %s (Value Rs. in lakh)" % vn, "=(D%d)/100000" % R(28)
@@ -3084,16 +3146,17 @@ def fw_creditors(ws, F, cfg, X, P):
     for c, t in zip("BCDEF", ["Month", "Purchase as per GSTR2B", "Creditors amount as per Stock statement",
                               "Creditors amount as per Books of Accounts", "Variance %"]):
         ws["%s%d" % (c, R(12))] = t
-    for m in [m for m in list(ws.merged_cells.ranges) if m.min_col == 3 and m.min_row == R(13)]:
-        ws.unmerge_cells(str(m))
+    for mr in [x for x in list(ws.merged_cells.ranges) if x.min_col == 3 and x.min_row == R(13)]:
+        ws.unmerge_cells(str(mr))
     for i, p in enumerate(P):
         r = R(13) + i
         ws["B%d" % r], ws["D%d" % r] = "=B%d" % (3 + i), (X["ss"].get(p["day"]) or {}).get("creditors")
-        ws["E%d" % r], ws["F%d" % r] = "=C%d" % (3 + i), '=IFERROR((E%d-D%d)/E%d,"")' % (r, r, r)
-    ws["C%d" % R(13)] = "Unable to comment"            # no GSTR-2B in the documents
+        # variance = (SS - books) / SS, as every debtors sheet and 5 of 6 creditors sheets (Gold Star's flip is a draft error)
+        ws["E%d" % r], ws["F%d" % r] = "=C%d" % (3 + i), '=IFERROR((D%d-E%d)/D%d,"")' % (r, r, r)
+    ws["C%d" % R(13)] = "Not provided by the borrower"  # no GSTR-2B in the documents (Baid, Clan, Bhawani wording)
     if n > 1:
         ws.merge_cells(start_row=R(13), start_column=3, end_row=R(13) + n - 1, end_column=3)
-    c0 = max(R(19), R(13) + n + 3)
+    c0 = max(R(19), R(13) + m + 3)
     ws["C%d" % c0], ws["D%d" % c0], ws["E%d" % c0] = "Name of The Creditor", "O/S", "Share (%)"
     # creditors of 5% or more on the visit date (credit balances only), amounts in Rs as the drafts write them
     day = X["visit"] if X["visit"] in (F.get("cred_parties") or {}) else X["base"]
@@ -3403,7 +3466,10 @@ def browser_make(form_json, out):
     pf = lambda k, dflt: (lambda m: (int(m.group(2)) + (2000 if int(m.group(2)) < 100 else 0), MON[m.group(1)[:3].lower()]) if m else dflt)(
         re.match(r"\s*([A-Za-z]{3,9})[\s'-]*(\d{2,4})", f.get(k) or ""))
     fl = lambda k: sn(str(f.get(k) or ""))
-    cfg = dict(own=own, borrower=own[0] if own else "", gstin=(f.get("gstin") or "").strip(), related=lines(f.get("related")), extra=extra,
+    tag = re.compile(r"\s*\((?:40A[^)]*|exclude)\)\s*$", re.I)
+    rel = lines(f.get("related"))
+    cfg = dict(own=own, borrower=own[0] if own else "", gstin=(f.get("gstin") or "").strip(), related=[tag.sub("", x) for x in rel],
+               related_excl=[tag.sub("", x) for x in rel if tag.search(x)], extra=extra,
                annual=[dict(zip(("stock", "sales", "debtors", "creditors", "purchases"), [sn(x.strip()) for x in y.split(",")] + [None] * 5))
                        for y in re.split(r"[;\n]", f.get("annual") or "")],
                banks=banks, facilities=facilities, sum_from=pf("from", fr), sum_to=pf("to", to), pm_value=fl("pm"), collateral_value=fl("coll"),
