@@ -987,6 +987,8 @@ def tally_pdf_kind(t):
     if re.search(r"Group Monthly Summary|Monthly Summary", ends) and re.search(r"\|Sales(?: Accounts| Local| A/c)?\|", f) \
             and not re.search(r"Purchase", ends, re.I):
         return "Sales"
+    if re.search(r"Group Monthly Summary|Monthly Summary", ends) and re.search(r"\|Purchases?(?: Accounts| A/c| Local)?\|", f, re.I):
+        return "Purchase"                       # Baid 'MONTHLY_PURCHASE_25-26.pdf': PURCHASE group, Dr closings
     if re.search(r"Stock\s*(?:Group|Item|Category)?\s*Monthly\s*Summary", ends, re.I):
         return "StockMonthly"
     if re.search(r"Stock (?:Group )?Summary", ends):
@@ -1122,6 +1124,8 @@ def tally_pdf_sales(t):
     y = int(st.group(2)); y = y + 2000 if y < 100 else y; m = MON[st.group(1).lower()]
     names = [dt.date(2000, i, 1).strftime("%B") for i in range(1, 13)]
     out, prev = {}, None
+    if re.search(r"Opening Balance\|(?:" + "|".join(names) + r")\|", f):
+        prev = 0.0                  # no opening amount printed (Baid): the first month is its closing balance itself
     for mm in re.finditer(r"(?<=\|)(" + "|".join(names) + r")\|(" + PDF_AMT + r")\s*(Cr|Dr)?(?:\|(" + PDF_AMT + r")\s*(Cr|Dr)?)?(?=\|)", f):
         mi = names.index(mm.group(1)) + 1
         while mi != m:
@@ -1150,6 +1154,32 @@ def stock_receivable_statement(t):
     deb, gt = amt(r"Total\s*Book\s*Debts"), amt(r"over\s*the\s*above\s*Rs\.?")
     return dict(date=day, stock=stock, creditors=amt(r"Unpaid\s*stock\s*/?\s*creditors?"), debtors=deb, gt90=gt,
                 lt90=round(deb - gt, 2) if deb is not None and gt is not None else None, split=None, check=True)
+
+
+def annexure_stock_statement(t):
+    """Axis 'Annexure A - Stock Statement Format- Templated' (Baid Jan'26 / Feb'26, scanned -> OCR): '1 Stock 1570.63',
+    'a. Unpaid Stock/creditor 255.88', 'Total Book Debts/Receivables (less than [1020.19', '... over and (0.00 above the
+    permissible tenor', Rs lakh. OCR spoils the date ('ason 28™FEB’2026'), so day / month / year are read loosely."""
+    f = t.replace("\n", " ")
+    if not re.search(r"Stock\s*Statement\s*Format", f, re.I):
+        return None
+    m = re.search(r"Statement\s*as\s*on\s*(\d{1,2})\D{0,4}?([A-Za-z]{3,9})\W{0,3}((?:20)?\d{2})\b", f, re.I)
+    day = None
+    if m and m.group(2)[:3].lower() in MON:
+        try:
+            y = int(m.group(3)); day = dt.date(y if y > 99 else 2000 + y, MON[m.group(2)[:3].lower()], int(m.group(1)))
+        except ValueError:
+            day = None
+    if day is None:
+        u = re.search(r"Upto\s*(\d{2}[./-]\d{2}[./-]\d{4})", f, re.I)
+        day = d(re.sub(r"[./]", "-", u.group(1))) if u else None
+    amt = lambda rx: (lambda x: num(x.group(1)) if x else None)(re.search(rx + r"[^0-9]{0,40}?(\d[\d,]*\.\d{2})\b", f, re.I))
+    stock = amt(r"\b1\s*\|?\s*Stock\b")
+    if day is None or stock is None:
+        return None
+    deb, gt = amt(r"Total\s*Book\s*Debts\s*/?\s*Receivables"), amt(r"over\s*and")
+    return dict(date=day, stock=stock, creditors=amt(r"Unpaid\s*Stock\s*/?\s*creditors?"), debtors=deb, gt90=gt,
+                lt90=round(deb - (gt or 0), 2) if deb is not None else None, split=None, check=True)
 
 
 def company_stock_statement(t):
@@ -1556,8 +1586,8 @@ def scan_file(F, p, log):
                     a, tx = bank_pdf(t); [x.update(src=fn) for x in tx]; F["bank"].setdefault(a, []).extend(tx); F["bank_name"][a] = F["bank_name"].get(a) or bank_of(t); log.append(("Bank PDF", fn, "%d txns; %s" % (len(tx), bal_msg(tx))))
                 elif stock_statement(t):
                     r = stock_statement(t); F["ss"].append(r); log.append(("Stock statement", fn, "%s stock %s" % (r["date"], r["stock"])))
-                elif company_stock_statement(t):
-                    r = company_stock_statement(t); F["ss"].append(r)
+                elif annexure_stock_statement(t) or company_stock_statement(t):
+                    r = annexure_stock_statement(t) or company_stock_statement(t); F["ss"].append(r)
                     log.append(("Stock statement", fn, "%s stock %s lakh (company format, text looks OCR'd - check)" % (r["date"], r["stock"])))
                 elif tally_pdf_kind(t):
                     k = tally_pdf_kind(t)
@@ -1580,6 +1610,9 @@ def scan_file(F, p, log):
                             F["book"].extend(rs); log.append(("Book stock", fn, "; ".join("%s %s lakh" % (r["date"], r["stock"]) for r in rs) + " (PDF)"))
                         else:
                             log.append(("skipped", fn, "stock summary without a grand total"))
+                    elif k == "Purchase":                    # same monthly summary, Dr balances: purchases = -(change)
+                        r = {ym: round(-v, 2) for ym, v in (tally_pdf_sales(t) or {}).items()}; F.setdefault("purch", {}).update(r)
+                        log.append(("Books purchase", fn, "%d months (PDF)" % len(r)))
                     else:
                         r = tally_pdf_sales(t) or {}; F.setdefault("sales", {}).update(r)
                         log.append(("Books sales", fn, "%d months (PDF)" % len(r)))
@@ -2782,6 +2815,38 @@ def fw_dp(ws, F, cfg, X):
         r = top + 5
         ws.cell(r, 3, "=SUM(C%d:C%d)" % (top + 2, top + 4)); ws.cell(r, 4, "=SUM(D%d:D%d)" % (top + 2, top + 4))
         ws.cell(r, 5, '=IFERROR(F%d/C%d,"")' % (r, r)); ws.cell(r, 6, "=C%d-D%d" % (r, r))
+    if len(banks) < 2:
+        # one bank (Baid, Denis, Clan): no second-bank / proportionate DP rows - Eligible DP = MIN(limit, total DP)
+        for c in col:
+            ws[c + "21"] = "=MIN(%s16,%s15)" % (c, c)
+        _drop_rows(ws, 17, 4)
+
+
+_REF = re.compile(r"(?:(?:'([^']+)'|([A-Za-z_][\w.]*))!)?(?<![\w.])(\$?[A-Z]{1,3}\$?)(\d+)\b(?!\s*\()")
+
+
+def _drop_rows(ws, at, k):
+    """Delete rows at..at+k-1 and move every reference below them up by k - formulas on this sheet and the other
+    sheets' 'Sheet'!A1 references (openpyxl's delete_rows moves neither the formulas nor the merged ranges)."""
+    wb = ws.parent
+    below = [m for m in list(ws.merged_cells.ranges) if m.max_row >= at]
+    for m in below:
+        ws.unmerge_cells(str(m))
+    ws.delete_rows(at, k)
+    for m in below:
+        if m.min_row >= at + k:
+            ws.merge_cells(start_row=m.min_row - k, start_column=m.min_col, end_row=m.max_row - k, end_column=m.max_col)
+    for sh in wb.worksheets:
+        for row in sh.iter_rows():
+            for c in row:
+                if not (isinstance(c.value, str) and c.value.startswith("=")):
+                    continue
+                def mv(mo):
+                    n = int(mo.group(4))
+                    if (mo.group(1) or mo.group(2) or sh.title) != ws.title or n < at + k:
+                        return mo.group(0)
+                    return mo.group(0)[:-len(mo.group(4))] + str(n - k)
+                c.value = _REF.sub(mv, c.value)
 
 
 def _grow(ws, at, k):
@@ -2813,9 +2878,24 @@ def _sales_m(F, ym):
     return g3.get(ym, g1.get(ym))
 
 
+def _fy_years(X):
+    """Audited years the holding sheets show: the last 31 March at least six months before the stock date (audit done),
+    and with monthly stock statements the year before it too - every draft: F.Y. 2024-25 (+ 2023-24 when monthly)."""
+    b = X["base"]
+    fy = b.year if (b.month, b.day) >= (9, 30) else b.year - 1
+    return [fy - i for i in range(2 if X["step"] == 1 else 1)]
+
+
+def _annual(cfg, i):
+    """Typed audited-year figures: 'stock, sales, debtors, creditors, purchases', a second year after ';'."""
+    a = cfg.get("annual") or []
+    a = [a] if isinstance(a, dict) else a
+    return a[i] if i < len(a) else {}
+
+
 def fw_stock(ws, F, cfg, X, P):
-    n = len(P); o = max(0, n - 3)
-    _grow(ws, 6, o)
+    n = len(P); m = max(n, 12 if X["step"] == 1 else n); o = max(0, m - 3)    # monthly: 12 rows kept, as the drafts
+    _grow(ws, 6, o); _grow(ws, 11 + o, len(_fy_years(X)) - 1)
     ws["A1"] = " " * 173 + "(amt in lacs)"
     for c, t in zip("ABCDEFIJKLMNOP", ["Month", "Purchase", "Total Stock", "Sales", "Cumulative Sales", "Holding period",
                                        "Sale as per book ", "Sale as per Gstr", "Difference", "GST 2B", "Purchase", "Stock", "Debtors", "Creditors"]):
@@ -2837,13 +2917,15 @@ def fw_stock(ws, F, cfg, X, P):
         ws["F%d" % r] = "=C%d/E%d*G%d" % (r, r, r); ws["G%d" % r] = p["days"]; ws["H%d" % r] = "=A%d" % r
         ws["I%d" % r] = sum(bs[m] for m in p["months"]) if all(m in bs for m in p["months"]) else None
         ws["J%d" % r] = "=SUM(M%d:M%d)" % (a, b); ws["K%d" % r] = "=I%d-J%d" % (r, r)
-    ws["A%d" % (3 + n)], ws["F%d" % (3 + n)] = "Average", "=AVERAGE(F3:F%d)" % (2 + n)
-    fy = X["base"].year - 1 if X["base"].month >= 4 else X["base"].year - 2          # last audited year end (31-03-fy)
-    R = lambda r: r + o
+    ws["A%d" % (3 + m)], ws["F%d" % (3 + m)] = "Average", "=AVERAGE(F3:F%d)" % (2 + m)
+    fys = _fy_years(X); fy = fys[0]; e = len(fys) - 1                                       # last audited year end (31-03-fy)
+    R = lambda r: r + o + (e if r >= 11 else 0)
     ws["A%d" % R(9)], ws["B%d" % R(9)], ws["C%d" % R(9)], ws["D%d" % R(9)] = "Period", "Total", "Sales", "Holding Days"
-    an = cfg.get("annual") or {}
-    ws["A%d" % R(10)], ws["D%d" % R(10)], ws["E%d" % R(10)] = "F.Y. %d-%02d" % (fy - 1, fy % 100), "=B%d/C%d*E%d" % (R(10), R(10), R(10)), 365
-    ws["B%d" % R(10)], ws["C%d" % R(10)], ws["B%d" % R(36)] = an.get("stock"), an.get("sales"), an.get("stock")
+    for i, y in enumerate(fys):
+        r, an = R(10) + i, _annual(cfg, i)
+        ws["A%d" % r], ws["D%d" % r], ws["E%d" % r] = "F.Y. %d-%02d" % (y - 1, y % 100), "=B%d/C%d*E%d" % (r, r, r), 365
+        ws["B%d" % r], ws["C%d" % r] = an.get("stock"), an.get("sales")
+    ws["B%d" % R(36)] = _annual(cfg, 0).get("stock")
     ws["R1"], ws["U1"], ws["Q2"], ws["R2"], ws["S2"] = "Books", "SS", "Stock", "Debtors", "Creditors"
     for c, t in zip("ABCD", ["Inventory Details", "Quantity", "Rate", "Value in INR"]):
         ws["%s%d" % (c, R(12))] = t; ws["%s%d" % (c, R(21))] = t
@@ -2886,8 +2968,8 @@ def fw_stock(ws, F, cfg, X, P):
 
 
 def fw_debtors(ws, F, cfg, X, P, so):
-    n = len(P); o = max(0, n - 3)
-    _grow(ws, 6, o)
+    n = len(P); m = max(n, 12 if X["step"] == 1 else n); o = max(0, m - 3)    # monthly: 12 rows kept, as the drafts
+    _grow(ws, 6, o); _grow(ws, 12 + o, len(_fy_years(X)) - 1)
     ws["E1"] = 100000
     for c, t in zip("BCDEF", ["Month", "Total Debtors", "Sales", "Cumulative Sales", "Holding period"]):
         ws[c + "2"] = t
@@ -2896,14 +2978,15 @@ def fw_debtors(ws, F, cfg, X, P, so):
         ws["B%d" % r], ws["C%d" % r], ws["D%d" % r] = "='Stock Holding'!A%d" % r, X["L"](_at(F["deb_tot"], p["day"])), "='Stock Holding'!D%d" % r
         ws["E%d" % r] = "=D%d" % r if i == 0 else "=D%d+E%d" % (r, r - 1)
         ws["F%d" % r], ws["G%d" % r] = "=+C%d/E%d*G%d" % (r, r, r), "='Stock Holding'!G%d" % r
-    ws["B%d" % (3 + n)], ws["F%d" % (3 + n)] = "Average", "=AVERAGE(F3:F%d)" % (2 + n)
-    R = lambda r: r + o
-    fy = X["base"].year - 1 if X["base"].month >= 4 else X["base"].year - 2
+    ws["B%d" % (3 + m)], ws["F%d" % (3 + m)] = "Average", "=AVERAGE(F3:F%d)" % (2 + m)
+    fys = _fy_years(X); e = len(fys) - 1
+    R = lambda r: r + o + (e if r >= 12 else 0)
     for c, t in zip("BCDE", ["Year", "Total Debtors", "Sales", "Holding period"]):
         ws["%s%d" % (c, R(10))] = t
-    r = R(11)
-    ws["B%d" % r], ws["D%d" % r], ws["E%d" % r], ws["F%d" % r] = "F.Y. %d-%02d" % (fy - 1, fy % 100), "='Stock Holding'!C%d" % (10 + so), "=C%d/D%d*F%d" % (r, r, r), 365
-    ws["C%d" % r] = (cfg.get("annual") or {}).get("debtors")
+    for i, y in enumerate(fys):
+        r = R(11) + i
+        ws["B%d" % r], ws["D%d" % r], ws["E%d" % r], ws["F%d" % r] = "F.Y. %d-%02d" % (y - 1, y % 100), "='Stock Holding'!C%d" % (10 + so + i), "=C%d/D%d*F%d" % (r, r, r), 365
+        ws["C%d" % r] = _annual(cfg, i).get("debtors")
     # debtors of 5% or more on the visit date (books ageing of that day), else the base date
     day = X["visit"] if X["visit"] in X["ages"] else X["base"]
     ag = X["ages"].get(day)
@@ -2979,8 +3062,8 @@ def fw_debtors(ws, F, cfg, X, P, so):
 
 
 def fw_creditors(ws, F, cfg, X, P):
-    n = len(P); o = max(0, n - 3)
-    _grow(ws, 6, o)
+    n = len(P); m = max(n, 12 if X["step"] == 1 else n); o = max(0, m - 3)    # monthly: 12 rows kept, as the drafts
+    _grow(ws, 6, o); _grow(ws, 11 + o, len(_fy_years(X)) - 1)
     for c, t in zip("BCDEF", ["Month", "Total Creditors", "Purchases", "Cumulative Purchases", "Holding period"]):
         ws[c + "2"] = t
     for i, p in enumerate(P):
@@ -2989,13 +3072,15 @@ def fw_creditors(ws, F, cfg, X, P):
         ws["D%d" % r] = "='Stock Holding'!B%d" % r
         ws["E%d" % r] = "=D%d" % r if i == 0 else "=D%d+E%d" % (r, r - 1)
         ws["F%d" % r], ws["G%d" % r] = "=C%d/E%d*G%d" % (r, r, r), "='Stock Holding'!G%d" % r
-    ws["B%d" % (3 + n)], ws["F%d" % (3 + n)] = "Average", "=AVERAGE(F3:F%d)" % (2 + n)
-    R = lambda r: r + o
-    fy = X["base"].year - 1 if X["base"].month >= 4 else X["base"].year - 2
+    ws["B%d" % (3 + m)], ws["F%d" % (3 + m)] = "Average", "=AVERAGE(F3:F%d)" % (2 + m)
+    fys = _fy_years(X); e = len(fys) - 1
+    R = lambda r: r + o + (e if r >= 11 else 0)
     for c, t in zip("BCDE", ["Year", "Total Creditors", "Purchases", "Holding period"]):
         ws["%s%d" % (c, R(9))] = t
-    ws["B%d" % R(10)], ws["E%d" % R(10)], ws["F%d" % R(10)] = "F.Y. %d-%02d" % (fy - 1, fy % 100), "=C%d/D%d*F%d" % (R(10), R(10), R(10)), 365
-    ws["C%d" % R(10)], ws["D%d" % R(10)] = (cfg.get("annual") or {}).get("creditors"), (cfg.get("annual") or {}).get("purchases")
+    for i, y in enumerate(fys):
+        r, an = R(10) + i, _annual(cfg, i)
+        ws["B%d" % r], ws["E%d" % r], ws["F%d" % r] = "F.Y. %d-%02d" % (y - 1, y % 100), "=C%d/D%d*F%d" % (r, r, r), 365
+        ws["C%d" % r], ws["D%d" % r] = an.get("creditors"), an.get("purchases")
     for c, t in zip("BCDEF", ["Month", "Purchase as per GSTR2B", "Creditors amount as per Stock statement",
                               "Creditors amount as per Books of Accounts", "Variance %"]):
         ws["%s%d" % (c, R(12))] = t
@@ -3072,6 +3157,8 @@ def default_period(F):
         if deb:
             first = _ym_add(ym(deb[0]), 1)
             last = min(ym(deb[-1]), last_bank)
+            if ss and first <= ym(ss[-1]):
+                last = min(last, ym(ss[-1]))         # not past the latest stock statement (Baid: books to Mar'26, SS Feb'26)
             if first <= last:
                 return first, min(last, _ym_add(first, 11))
         end = max(inb or [hi])
@@ -3242,7 +3329,7 @@ def ocr_merge(path, text, fields_json):
         r = sanction_letter(text); F.setdefault("sanction", []).append(dict(bank=letter_bank(text), fac=r, file=fn, ocr=True))
         got.append("sanction letter: " + "; ".join("%s %s lakh" % x for x in r))
     if not got:
-        ss = stock_statement(text) or stock_receivable_statement(text) or company_stock_statement(text)
+        ss = stock_statement(text) or stock_receivable_statement(text) or annexure_stock_statement(text) or company_stock_statement(text)
         if ss:
             ss["check"] = True
             nm = re.sub(r"[^A-Za-z0-9]", " ", fn).upper()
@@ -3317,7 +3404,8 @@ def browser_make(form_json, out):
         re.match(r"\s*([A-Za-z]{3,9})[\s'-]*(\d{2,4})", f.get(k) or ""))
     fl = lambda k: sn(str(f.get(k) or ""))
     cfg = dict(own=own, borrower=own[0] if own else "", gstin=(f.get("gstin") or "").strip(), related=lines(f.get("related")), extra=extra,
-               annual=dict(zip(("stock", "sales", "debtors", "creditors", "purchases"), [sn(x.strip()) for x in (f.get("annual") or "").split(",")] + [None] * 5)),
+               annual=[dict(zip(("stock", "sales", "debtors", "creditors", "purchases"), [sn(x.strip()) for x in y.split(",")] + [None] * 5))
+                       for y in re.split(r"[;\n]", f.get("annual") or "")],
                banks=banks, facilities=facilities, sum_from=pf("from", fr), sum_to=pf("to", to), pm_value=fl("pm"), collateral_value=fl("coll"),
                visit=extra[0]["date"] if extra else None, visit_stock=extra[0]["stock"] if extra else None)
     build_excel_draft(F, cfg, out)
@@ -3341,6 +3429,7 @@ Entry fields (null when not printed; dates "DD-MM-YYYY"; money in rupees as plai
  bill_date, due_date, filed_date (GST return ARN / filing date),
  gst_a, gst_b, gst_c: GSTR-3B table 3.1 rows (a), (b), (c) taxable value; gst_taxable: GSTR-1 total taxable value,
  stock_date and stock_lakh (total inventory / stock as on that date, Rs lakh), debtors_lakh, creditors_lakh,
+ debtors_over_lakh (book debts over the permissible tenor / above 90 days, Rs lakh),
  insurer, policy_class ("Fire" / "Burglary" / "Other"), from_date, to_date, stock_si (sum insured of stocks only, rupees).
 Read every page. Copy figures and dates exactly as printed - never compute, round or guess; use null if unsure.
 Read years carefully from the full date printed (e.g. 15-09-2026), never from a reference number."""
@@ -3471,8 +3560,13 @@ def ai_merge(path, text):
                 row(e, what, False, "date or stock missing"); continue
             if sd in {s["date"] for s in F["ss"]}:
                 row(e, what, False, "date already read by a rule"); continue
-            F["ss"].append(dict(date=sd, stock=st, creditors=_ai_money(e.get("creditors_lakh")),
-                                debtors=_ai_money(e.get("debtors_lakh")), split=None, check=True, ai=True)); used += 1
+            db, ov = _ai_money(e.get("debtors_lakh")), _ai_money(e.get("debtors_over_lakh"))
+            # a statement whose file name carries the same month / year ('Feb'26.pdf') may set the base date, as with OCR
+            nm = re.sub(r"[^A-Za-z0-9]", " ", fn).upper()
+            ok = bool(re.search(r"%s[A-Z]*\s*'?(?:20)?%02d\b" % (sd.strftime("%b").upper(), sd.year % 100), nm))
+            F["ss"].append(dict(date=sd, stock=st, creditors=_ai_money(e.get("creditors_lakh")), debtors=db, gt90=ov,
+                                lt90=round(db - (ov or 0), 2) if db is not None else None,
+                                split=None, check=True, ai=True, date_ok=ok)); used += 1
             row(e, what, True)
         elif kind == "insurance_policy":
             no = re.sub(r"\s+", "", str(e.get("ref") or "")); si = _ai_money(e.get("stock_si"))
