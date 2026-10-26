@@ -602,10 +602,10 @@ def tally_sales(rows, head):
             if (y, m) in seen:
                 continue
             seen.add((y, m))
-            nums = [c for c in r[1:] if isinstance(c, (int, float))]
-            dr = num(r[1] or 0) if len(r) > 1 and isinstance(r[1], (int, float)) else 0.0
-            cr = num(r[2] or 0) if len(r) > 2 and isinstance(r[2], (int, float)) else 0.0
-            if nums:
+            # amounts may be numbers or text '1,01,72,40,746.06' (Bhawani's export) - both are read
+            dr = (_cellnum(r[1]) or 0.0) if len(r) > 1 else 0.0
+            cr = (_cellnum(r[2]) or 0.0) if len(r) > 2 else 0.0
+            if any(_cellnum(c) is not None for c in r[1:3]):
                 out[(y, m)] = round(cr - dr, 2)
     return out or None
 
