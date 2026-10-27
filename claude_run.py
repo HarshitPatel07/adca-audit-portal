@@ -13,7 +13,13 @@ import core, openpyxl
 core.TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "template.xlsx")
 
 
+def need(W):
+    if not os.path.isdir(W) or not any(fs for _, _, fs in os.walk(W)):
+        sys.exit("Folder not found or empty: %s - give the borrower's Working folder" % W)
+
+
 def scan(W):
+    need(W)
     s = json.loads(core.browser_scan(W))
     for a, b, c in core._B["log"]:
         print("%-18s %-55s %s" % (a[:18], b[:55], c[:110]))
@@ -79,15 +85,20 @@ def ocr():
 
 
 def make(W, facts, out, draft=None):
+    need(W)
     core.browser_scan(W)
     ocr()
     cf = json.load(open(facts, encoding="utf-8"))
     paths = {os.path.basename(p): p for p in core._B["paths"]}
     for fn, js in (cf.get("ai") or {}).items():            # Claude's reading of the scanned files, checked by the rules
+        if fn not in paths:
+            print("ai: no file named %r in Working - skipped (use the exact file name)" % fn); continue
         core.ai_merge(paths[fn], json.dumps(js))
     F = core._B["F"]
     for b in cf.get("books") or []:                         # scanned Tally books Claude read (visit-date stock / debtors / creditors)
-        day = core.d(b["date"])
+        day = core.d(b.get("date") or "")
+        if not day:
+            print("books: entry without a valid dd-mm-yyyy date - skipped"); continue
         if b.get("stock_rs") is not None:
             F["book"].append(dict(date=day, stock=b["stock_rs"] / 1e5))
         if b.get("debtors_rs") is not None:

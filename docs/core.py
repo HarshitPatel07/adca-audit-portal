@@ -193,6 +193,20 @@ def gstr3b(t):
     f = t.replace("\n", "|")
     if "GSTR-3B" not in f:
         return None
+    if re.search(r"System generated summary", f, re.I):
+        # the portal's auto-drafted GSTR-3B summary (Shrigovind Jul-Nov 2025: the filed 3B is not in the folder) - same
+        # Table 3.1 rows, laid out 'Financial year|2025-26|Tax period|November' with the row labels broken over lines
+        g = re.search(r"GSTIN\s*\|(\w{15})", f)
+        yr = re.search(r"Financial year\s*\|(\d{4})-(\d{2})\s*\|Tax period\s*\|(\w+)", f)
+        a = re.search(r"\(a\)\s*Outward.*?exempted\)\s*\|([\d.,-]+)", f)
+        if not (g and yr and a):
+            return None
+        zb = re.search(r"\(b\)\s*Outward.*?zero\s*\|?\s*rated\)\s*\|([\d.,-]+)", f)
+        nc = re.search(r"\(c\)\s*Other\s*\|?\s*outward.*?exempted\)\s*\|([\d.,-]+)", f)
+        m = MON[yr.group(3)[:3].lower()]
+        ta, tb, tc = num(a.group(1)), num(zb.group(1)) if zb else 0.0, num(nc.group(1)) if nc else 0.0
+        return dict(kind="3B", gstin=g.group(1), ym=(int(yr.group(1)) + (1 if m < 4 else 0), m), taxable=round(ta + tb, 2),
+                    sales=round(ta + tb + tc, 2), arn="", system=True)
     g = re.search(r"GSTIN of the supplier\|(\w{15})", f)
     yr = re.search(r"Year\|(\d{4})-(\d{2})\|Period\|(\w+)", f)
     a = re.search(r"\(a\) Outward taxable supplies.*?exempted\)\|([\d.,-]+)", f)
@@ -731,6 +745,20 @@ BANK_NAMES = (r"\b(?:AXIS BANK|STATE BANK OF INDIA|UNION BANK OF INDIA|BANK OF I
               r"(?:\s*(?:LTD|LIMITED)\.?)?(?:\s*,\s*[A-Z]{3,15})?")
 
 
+def hpn_endorsement(t):
+    """Endorsement that changes the hypothecation of a policy (Shriram 'ENDORSEMENT ... HPN BANK NAME: AXIS BANK LTD. This
+    endorsement is made effective from the date 17-02-2026' / 'Attached to and forming part of Policy No')."""
+    if not (re.search(r"ENDORSEMENT", t) and re.search(r"Hypothecation|HPN", t, re.I)):
+        return None
+    no = re.search(r"\b(\d{6}/\d{2}/\d{2}/\d{6})\b", t)
+    bm = re.search(r"(?:HPN BANK NAME|Hypothecation)[^\n]{0,80}?" + BANK_NAMES, t.replace("\n", " "), re.I)
+    eff = re.search(r"effective from the date\s*(\d{2}-\d{2}-\d{4})", t.replace("\n", " "), re.I)
+    if not (no and bm):
+        return None
+    bank = re.search(BANK_NAMES, bm.group(0), re.I).group(0)
+    return dict(no=no.group(1), bank=re.sub(r"\s+", " ", bank).upper().strip(" .,"), eff=eff.group(1) if eff else "")
+
+
 def _policy_details(f, p):
     """Nature of the policy, financier (bank) and insured address - shown in the Insurance sheet blocks."""
     # product name as the schedule prints it ('ICICI LOMBARD MSME SURAKSHA KAVACH', 'FLEXI COMMERCIAL PROPERTY GUARD')
@@ -752,7 +780,8 @@ def _policy_details(f, p):
             break
     p["bank"] = " & ".join(banks)
     loc = None
-    for rx in (r"Location (?:Details|address)\s*\|?\s*(?:with Pin Code\s*\|)?\s*:?\s*((?:[^|]{3,120}\|){1,3}?)(?=First Loss|Occupancy|Risk|Ris\||Building|Type|Location|Sum|\d{6}\d{6})",
+    for rx in (r"Location of the Risk\s*:?\s*\|([^|]{10,150})\|",          # Shriram: 'Location of the Risk  :|Sanger, ...'
+               r"Location (?:Details|address)\s*\|?\s*(?:with Pin Code\s*\|)?\s*:?\s*((?:[^|]{3,120}\|){1,3}?)(?=First Loss|Occupancy|Risk|Ris\||Building|Type|Location|Sum|\d{6}\d{6})",
                r"(?:Insured Address|Risk Location Address|Mailing Address of the Insured\s*:?)\s*\|?\s*:?\s*((?:[^|]{3,120}\|){1,4}?)(?=Policy|Phone|PAN|GSTIN|Bank|Mobile|E-?mail|Are you|Occupancy|Product)",
                r"\|Address\s*\|?\s*:?\s*\|?\s*:?\s*((?:[^|]{2,80}\|){1,5}?)(?=GSTIN|Phone|PAN|Mobile|E-?mail|Address)"):
         for m2 in re.finditer(rx, f, re.I):
@@ -762,6 +791,31 @@ def _policy_details(f, p):
         if loc:
             break
     p["location"] = loc or ""
+    # Shriram schedules: 'SMI Desc|Building|Plant & Machinery|Stocks including ...|...|5,50,00,000|8,50,00,000|11,00,00,000'
+    # (labels first, amounts after, same order); burglary: 'Stocks including ...|...|11,00,00,000|FACTORY'
+    if re.search(r"SHRIRAM GENERAL", f, re.I):
+        if p["cls"] == "Other" and re.search(r"BURGLARY\s*-\s*STANDARD POLICY SCHEDULE", f):
+            p["cls"], p["nature"] = "Burglary", "BURGLARY STANDARD POLICY"
+        if p["cls"] == "Fire" and re.search(r"SHRI ENTERPRISE FIRE INSURANCE POLICY", f):
+            p["nature"] = "SHRI ENTERPRISE FIRE INSURANCE POLICY"
+        m = re.search(r"SMI Desc\|((?:[^|]*\|){1,12}?)((?:\s*\d[\d,]{6,}\s*\|)+)", f)
+        if m:
+            labs, cur = [], None
+            for seg in m.group(1).split("|"):
+                k = re.match(r"\s*(Building|Plant|Stock|Furniture|Electric|Other)", seg, re.I)
+                if k:
+                    cur = {"buil": "Building", "plan": "Plant & Machinery", "stoc": "Stock"}.get(k.group(1)[:4].lower(), seg.strip())
+                    labs.append(cur)
+            amts = [num(a) / 1e5 for a in re.findall(r"\d[\d,]{6,}", m.group(2))]
+            if labs and len(labs) == len(amts):
+                p["items"] = list(zip(labs, amts))
+                st = dict(p["items"]).get("Stock")
+                if st is not None and p["stock"] is None:
+                    p["stock"] = st
+        if p["stock"] is None:
+            b = re.search(r"Stocks including[^|]*\|(?:[^|]*\|){0,3}?\s*(\d[\d,]{6,})\s*\|", f)
+            if b:
+                p["stock"] = num(b.group(1)) / 1e5
     if "items" not in p:
         p["items"] = [("Stock", p["stock"])] if p["stock"] is not None else []
 
@@ -823,7 +877,7 @@ def _policy(t, fname):
 
 
 # ---------- other insurers (IFFCO Tokio, ICICI Lombard, Bajaj, generic): label-value rules on the '|' text ----------
-INSURERS = [(r"IFFCO[- ]TOKIO", "IFFCO-TOKIO GENERAL INSURANCE CO. LTD"), (r"ICICI Lombard", "ICICI LOMBARD GENERAL INSURANCE CO. LTD"),
+INSURERS = [(r"SHRIRAM GENERAL INSURANCE", "SHRIRAM GENERAL INSURANCE CO. LTD"), (r"IFFCO[- ]TOKIO", "IFFCO-TOKIO GENERAL INSURANCE CO. LTD"),(r"ICICI Lombard", "ICICI LOMBARD GENERAL INSURANCE CO. LTD"),
             (r"Bajaj (?:General|Allianz)", "BAJAJ GENERAL INSURANCE LTD"), (r"NEW INDIA ASSURANCE", "THE NEW INDIA ASSURANCE CO. LTD."),
             (r"United India Insurance", "UNITED INDIA INSURANCE CO. LTD"), (r"National Insurance", "NATIONAL INSURANCE CO. LTD"),
             (r"Oriental Insurance", "THE ORIENTAL INSURANCE CO. LTD"), (r"HDFC ERGO", "HDFC ERGO GENERAL INSURANCE CO. LTD"),
@@ -1517,6 +1571,8 @@ def inv_resolve(F, own_names, own_gstin):
 
 def invoice_kind_hint(path):
     p = path.replace("\\", "/").lower()
+    if "purchase" in p and re.search(r"sale", p):        # 'sale and purchase invoices.pdf' (Shrigovind): per page
+        return ""
     return "purchase" if "purchase" in p else ("sales" if re.search(r"sale", p) else "")
 
 
@@ -1530,7 +1586,7 @@ def add_invoices(F, path, pages, ocr=False):
         if not r["unread"] and got and got[-1]["no"] == r["no"] and r["no"]:
             continue
         # page 2 / 3 of the same invoice: Tally 'Tax Invoice(Page 2)' and the e-Way Bill page ('Doc No. : Tax Invoice - 857')
-        if r["unread"] and got and (r["no"] == got[-1]["no"] or
+        if r["unread"] and got and ((r["no"] and r["no"] == got[-1]["no"]) or
                                     re.search(r"\(\s*Page\s*\d|^\s*e-?Way\s*Bill|Doc\s*No\.?\s*:?\s*Tax\s*Invoice", t[:300], re.I)):
             continue
         r.update(file=fn, page=i + 1, ocr=ocr, id="%s#%d" % (fn, i + 1)); got.append(r)
@@ -1555,6 +1611,12 @@ def pick_invoices(F, kind, n=3):
         out.append(x)
         if len(out) == n:
             break
+    # fewer parties than rows (Shrigovind: all four sales bills are Balrampur Chini Mills) -> the next bills, as the draft
+    for x in sorted([x for x in F.get("inv", []) if x["kind"] == kind], key=lambda x: (x["file"].lower(), x["page"])):
+        if len(out) >= n:
+            break
+        if x not in out and not x.get("unread"):
+            out.append(x)
     return out
 
 
@@ -1672,6 +1734,9 @@ def scan_file(F, p, log):
                 elif sanction_letter(t):
                     r = sanction_letter(t); F.setdefault("sanction", []).append(dict(bank=letter_bank(t), fac=r, file=fn))
                     log.append(("Sanction letter", fn, "; ".join("%s %s lakh" % x for x in r) + " - CHECK on the page"))
+                elif hpn_endorsement(t):
+                    r = hpn_endorsement(t); r["file"] = fn; F.setdefault("hpn", []).append(r)
+                    log.append(("Policy endorsement", fn, "%s: hypothecation to %s from %s" % (r["no"], r["bank"], r["eff"])))
                 elif re.search(r"Tax\s*Invoice|Invoice\s*No", t, re.I) and add_invoices(F, p, pdf_pages(p)):
                     r = [x for x in F["inv"] if x["file"] == fn]
                     log.append(("Invoice", fn, "%d invoice(s): %s" % (len(r), ", ".join(x["no"] or "page %d not readable" % x["page"] for x in r))))
@@ -1712,6 +1777,11 @@ def scan_file(F, p, log):
                 # classify from the first 200 rows; read the whole workbook only for a type that is used
                 # (big sales registers / GST Excel downloads took 40-85 s each to read in full)
                 top = xlsx_rows(p, 200)
+                t5 = top5_table(top)
+                if t5:                                        # borrower's 'Top 5 Supplier and Buyer' list with PANs
+                    F["top5"] = t5
+                    log.append(("Top 5 parties", fn, "; ".join("%s %s" % (k[0], n) for k, n, _ in t5)))
+                    return
                 k0, h0 = tally_kind(top)
                 if not (k0 or tally_sales(top, h0) or tally_purchase(top, h0) or mca_directors(top) or bank_table(top)[1]
                         or any(bank_table(r)[1] for r in sheet_tops(p))):     # a statement on a later sheet
@@ -1729,6 +1799,19 @@ def scan_file(F, p, log):
                 if ag and ag["date"]:
                     F.setdefault("ageing", []).append(ag)
                     log.append(("Debtor ageing", fn, "%s: <90 %.2f lakh, >90 %.2f lakh" % (ag["date"], ag["lt90"] / 1e5, ag["gt90"] / 1e5)))
+                if not (tt and tt["date"]) and not (ag and ag["date"]):
+                    for h in hand_debtors(p, fn):         # hand-made monthly list (no Tally group total / ageing found)
+                        tot = h["lt90"] + h["gt90"]
+                        if not any(r["date"] == h["date"] for r in F["deb_tot"]):
+                            F["deb_tot"].append(dict(date=h["date"], dr=tot, cr=0.0))
+                        A = F.setdefault("ageing", [])
+                        old = next((a for a in A if a["date"] == h["date"]), None)
+                        if old is None or (h["aged"] and not old.get("aged")):
+                            if old is not None:
+                                A.remove(old)
+                            A.append(dict(date=h["date"], lt90=h["lt90"], gt90=h["gt90"], parties=h["parties"], aged=h["aged"]))
+                        log.append(("Debtor list", fn, "%s: total %.2f lakh (<90 %.2f, >90 %.2f)%s" % (
+                            h["date"], tot / 1e5, h["lt90"] / 1e5, h["gt90"] / 1e5, "" if h["aged"] else " - no ageing printed")))
             elif k == "Sundry Creditors":
                 F["creditors"].update(tally_names(rows)); log.append(("Creditor ledger", fn, "names read"))
                 tt = tally_group_total(rows, head)
@@ -1764,7 +1847,98 @@ def scan_file(F, p, log):
         log.append(("ERROR", fn, repr(e)[:120]))
 
 
+def top5_table(rows):
+    """'Top 5 Supplier and Buyer' sheet (Shrigovind TOP 5\\Audit-0.xlsx): a 'Buyer' and a 'Supplier' heading, each over
+    S.no | Particular | PAN NO rows. -> [(kind, name, pan)] in sheet order, buyers first as printed."""
+    txt = [[str(c).strip() for c in r if c is not None and str(c).strip()] for r in rows]
+    if not any(re.search(r"top\s*\d+\s*supplier|top\s*\d+\s*buyer", " ".join(r), re.I) for r in txt[:5]):
+        return None
+    out, kind = [], None
+    for r in txt:
+        if len(r) == 1 and re.fullmatch(r"buyers?|customers?", r[0], re.I):
+            kind = "sales"
+        elif len(r) == 1 and re.fullmatch(r"suppliers?|vendors?", r[0], re.I):
+            kind = "purchase"
+        elif kind and len(r) >= 2 and re.fullmatch(r"\d+", r[0]):
+            pan = next((c for c in r[2:] if re.fullmatch(r"[A-Z]{5}\d{4}[A-Z]", c.upper())), "")
+            out.append((kind, r[1], pan.upper()))
+    return out or None
+
+
+def top5_amount(name, parties):
+    """Sum of the balances of every ledger of the same group (UltraTech's four units, J.K Cement's three); when the
+    ledgers of that first word are different companies (DALMIA CEMENT (BHARAT) vs DALMIA DSPLIMITED), only those whose
+    second word matches ('Cement' ~ 'CMENT' / 'CE,EMT' - the borrower's typing)."""
+    import difflib
+    w = lambda s: [x for x in re.findall(r"[A-Z]+", re.sub(r"[.,]", "", s.upper())) if x not in ("MS", "THE")]
+    nw = w(name)
+    if not nw:
+        return 0.0
+    same = [(n, v) for n, v in parties if w(n) and w(n)[0] == nw[0]]       # Siddhaye Logistics is not SIDDH CHEMIPLAST
+    if len(nw) > 1:
+        sec = [(n, v) for n, v in same if len(w(n)) > 1 and difflib.SequenceMatcher(None, w(n)[1], nw[1]).ratio() >= 0.7]
+        if sec:
+            same = sec
+    return sum(v for _, v in same)
+
+
+def hand_debtors(p, fn):
+    """Hand-made monthly debtors list (Shrigovind 'DEBTORS JULY 26': SNO | PARTY NAME | Closing Balance, or 0-90 | 91 and
+    above; then 'TOTAL :-'). The TOTAL row is typed in lakh in some months and Rs in others, so the party rows (Rs) are
+    summed. Date = month-end of the header's 'to' date (' 01.4.2026  to 31.07.2026', '31-7-2026', 'Aug-26' / datetime);
+    else the month in the sheet name ('DEBTORS MARCH 26'). Creditor sheets in the same workbook are left alone."""
+    out = []
+    for sname, rows in sheet_tables(p):
+        if not re.search(r"debtor", sname, re.I):
+            continue
+        hi = next((i for i, r in enumerate(rows[:15]) if any(re.search(r"party\s*name", str(c or ""), re.I) for c in r)), None)
+        if hi is None:
+            continue
+        head = [str(c or "").strip().lower() for c in rows[hi]]
+        ci = next((i for i, h in enumerate(head) if "party" in h), None)
+        cl = next((i for i, h in enumerate(head) if "closing" in h), None)
+        c1 = next((i for i, h in enumerate(head) if re.match(r"0\s*-\s*90$", h)), None)
+        c2 = next((i for i, h in enumerate(head) if re.match(r"9[01]\b.*above", h)), None)
+        if ci is None or (cl is None and c1 is None):
+            continue
+        day = None
+        for r in rows[:hi]:
+            for c in r:
+                if isinstance(c, (dt.datetime, dt.date)):
+                    day = month_end(c.year, c.month)
+                    continue
+                t = str(c or "")
+                m = re.findall(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})", t)
+                if m:
+                    day = month_end(int(m[-1][2]), int(m[-1][1]))
+                m = re.search(r"\b([A-Za-z]{3})[a-z]*[\s'-]*(\d{2})\b$", t.strip())
+                if not day and m and m.group(1).lower() in MON:
+                    day = month_end(2000 + int(m.group(2)), MON[m.group(1).lower()])
+        if not day:
+            m = re.search(r"([A-Za-z]{3})[a-z]*\s+(\d{2})\b", sname)
+            if m and m.group(1).lower() in MON:
+                day = month_end(2000 + int(m.group(2)), MON[m.group(1).lower()])
+        val = lambda r, i: r[i] if i is not None and i < len(r) and isinstance(r[i], (int, float)) else 0.0
+        parties = []
+        for r in rows[hi + 1:]:
+            nm = str(r[ci] or "").strip() if ci < len(r) else ""
+            if re.search(r"total", nm, re.I) or any(re.search(r"total", str(c or ""), re.I) for c in r[:ci]):
+                break
+            if not nm:
+                continue
+            parties.append((nm, val(r, c1) if c1 is not None else val(r, cl), val(r, c2)))
+        if day and parties:
+            out.append(dict(date=day, parties=parties, aged=c1 is not None,
+                            lt90=sum(x[1] for x in parties), gt90=sum(x[2] for x in parties)))
+    return out
+
+
 def scan_end(F, log):
+    for e in F.get("hpn", []):                        # hypothecation changed by endorsement: the later bank is the financier
+        for p in F["policies"]:
+            if p["no"] == e["no"]:
+                p["bank"] = e["bank"]
+                p["hpn_note"] = "hypothecation changed to %s from %s by endorsement" % (e["bank"], e["eff"])
     by = collections.OrderedDict()
     for od in F.get("od_parts", []):                  # CAL + PVCO divisions of the same date = the company
         g = by.setdefault(od["date"], dict(total=0.0, gt90=0.0, parties=[]))
@@ -2693,8 +2867,12 @@ def _at(rows, day, key=None, creditors=False):
 
 
 def _bal_on(F, acc, day):
-    """CC outstanding (Rs, positive) on a day: the balance after the last transaction on or before it."""
-    tx = [t for t in dedupe(F["bank"].get(acc, [])) if t["date"] <= day and t.get("bal") is not None]
+    """CC outstanding (Rs, positive) on a day: the balance after the last transaction on or before it.
+    A day after the statement ends has no balance (Shrigovind: statement to 31-07-2026, visit 12-10-2026)."""
+    all_tx = [t for t in dedupe(F["bank"].get(acc, [])) if t.get("bal") is not None]
+    if not all_tx or day > max(t["date"] for t in all_tx):
+        return None
+    tx = [t for t in all_tx if t["date"] <= day]
     return abs(tx[-1]["bal"]) if tx else None
 
 
@@ -2713,6 +2891,11 @@ def fw_ctx(F, cfg):
     # before the visit; else an 'as on' position before it (Bhawani 30-09-2025); else the latest book month-end before it
     near = lambda x: visit is None or (x < visit and (visit - x).days <= 190)
     good_ss = [x for x, s in ss.items() if not s.get("check") or s.get("date_ok")]
+    # the CC statement must reach the base date, or the DP has no 'Limit Utilised' (Shrigovind: SS to 31-08-2026, statement
+    # and balance confirmation to 31-07-2026 -> base 31-07-2026)
+    last_tx = max((t["date"] for tx in F["bank"].values() for t in tx), default=None)
+    if last_tx and any(x <= last_tx for x in good_ss):
+        good_ss = [x for x in good_ss if x <= last_tx]
     base = max([x for x in good_ss if x in books and near(x)] or [x for x in good_ss if near(x)] or
                [x for x in points if near(x)] or [x for x in books if near(x) and x == month_end(x.year, x.month)] or
                [month_end(*cfg["sum_to"])])
@@ -2759,9 +2942,12 @@ def fw_facility(ws, F, cfg, X):
     lim = lambda nm, v: -abs(v) if v is not None and sub(nm) else v
     a4 = b1[2] if len(b1) > 2 and b1[2] else "Cash Credit"
     ws["A4"], ws["B4"] = a4, lim(a4, b1[1])
-    ws["C4"], ws["E4"] = "='DP calculation'!D21", "='DP calculation'!E21"
-    ws["D4"] = X["L"](_bal_on(F, X["cc"], X["base"])) if X["cc"] else None
-    ws["F4"] = X["L"](_bal_on(F, X["cc"], X["visit"])) if X["cc"] and X["visit"] else None
+    # DP of the base date = the books column; with no book stock that day (Shrigovind 31-07-2026) the stock statement's
+    ws["C4"], ws["E4"] = "='DP calculation'!%s21" % ("D" if X["books"].get(X["base"]) else "C"), "='DP calculation'!E21"
+    # typed O/s from the bank's balance confirmation (banks line parts 4 / 5) wins; else the statement balance
+    ws["D4"] = b1[3] if len(b1) > 3 and b1[3] is not None else (X["L"](_bal_on(F, X["cc"], X["base"])) if X["cc"] else None)
+    ws["F4"] = b1[4] if len(b1) > 4 and b1[4] is not None else (
+        X["L"](_bal_on(F, X["cc"], X["visit"])) if X["cc"] and X["visit"] else None)
     extra = cfg.get("facilities") or []           # typed: name, limit, o/s on base date, o/s on visit date
     k = max(0, len(extra) - 1)
     _grow(ws, 6, k)                                 # more than one other facility (Bhawani: 10) -> rows added
@@ -2950,8 +3136,20 @@ def _annual(cfg, i):
     return a[i] if i < len(a) else {}
 
 
+def _hold_rows(P, X):
+    """Month rows of the holding tables: monthly stock statements keep 12 rows, as the drafts; but when no stock statement
+    exists before the first row (Shrigovind: Axis CC and statements start Nov'25 -> 9 months), only the months shown."""
+    n = len(P)
+    if X["step"] != 1 or n >= 12:
+        return n
+    first = P[0]["day"] if P else None
+    if first is not None and not any(x < first for x in X["ss"]):
+        return n
+    return 12
+
+
 def fw_stock(ws, F, cfg, X, P):
-    n = len(P); m = max(n, 12 if X["step"] == 1 else n); o = max(0, m - 3)    # monthly: 12 rows kept, as the drafts
+    m = _hold_rows(P, X); o = max(0, m - 3)
     _grow(ws, 6, o); _grow(ws, 11 + o, len(_fy_years(X)) - 1)
     ws["A1"] = " " * 173 + "(amt in lacs)"
     for c, t in zip("ABCDEFIJKLMNOP", ["Month", "Purchase", "Total Stock", "Sales", "Cumulative Sales", "Holding period",
@@ -3007,7 +3205,9 @@ def fw_stock(ws, F, cfg, X, P):
                              "% of variance in value (only Negative variance)"]):
         ws["%s%d" % (c, R(35))] = t
     ws["A%d" % R(36)], ws["C%d" % R(36)] = "Total", ye.get("stock")
-    ws["D%d" % R(36)], ws["E%d" % R(36)] = "=(B%d-C%d)/C%d" % (R(36), R(36), R(36)), "=B%d-C%d" % (R(36), R(36))
+    # no stock statement for 31 March (Shrigovind: Axis account opened Nov 2025) -> no variance, not #DIV/0!
+    ws["D%d" % R(36)], ws["E%d" % R(36)] = ("=(B%d-C%d)/C%d" % (R(36), R(36), R(36)), "=B%d-C%d" % (R(36), R(36))) \
+        if ye.get("stock") else (None, None)
     bn = X["base"].strftime("%d-%m-%Y")
     for top, lab, ref in ((39, "Stock Statement", "C3"), (42, "Books of Accounts", "D3")):
         ws["A%d" % R(top)] = "Stock position as per %s as on %s" % (lab, bn)
@@ -3030,7 +3230,7 @@ def fw_stock(ws, F, cfg, X, P):
 
 
 def fw_debtors(ws, F, cfg, X, P, so):
-    n = len(P); m = max(n, 12 if X["step"] == 1 else n); o = max(0, m - 3)    # monthly: 12 rows kept, as the drafts
+    m = _hold_rows(P, X); o = max(0, m - 3)
     _grow(ws, 6, o); _grow(ws, 12 + o, len(_fy_years(X)) - 1)
     ws["E1"] = 100000
     for c, t in zip("BCDEF", ["Month", "Total Debtors", "Sales", "Cumulative Sales", "Holding period"]):
@@ -3083,6 +3283,14 @@ def fw_debtors(ws, F, cfg, X, P, so):
     cp = (F.get("cred_parties") or {})
     cbal = {nospace(nm.upper())[:12]: c for nm, c in cp.get(day) or cp.get(X["visit"]) or cp.get(X["base"]) or []}
     r = k0 + 2
+    if F.get("top5"):                                 # the borrower's own top-5 list (names + PAN) wins over the invoices
+        dp = [(nm, lt + gt) for nm, lt, gt in (ag["parties"] if ag else [])]
+        cl = cp.get(day) or cp.get(X["visit"]) or cp.get(X["base"]) or []
+        for kind, nm, pan in F["top5"]:
+            amt = top5_amount(nm, dp if kind == "sales" else cl)
+            ws["B%d" % r], ws["C%d" % r], ws["D%d" % r], ws["E%d" % r] = nm, pan or None, kind.upper(), round(amt / 1e5, 2)
+            r += 1
+        return
     for kind, lab in (("sales", "SALES"), ("purchase", "PURCHASE")):
         rows = []
         if kind == "purchase":
@@ -3124,7 +3332,7 @@ def fw_debtors(ws, F, cfg, X, P, so):
 
 
 def fw_creditors(ws, F, cfg, X, P):
-    n = len(P); m = max(n, 12 if X["step"] == 1 else n); o = max(0, m - 3)    # monthly: 12 rows kept, as the drafts
+    m = _hold_rows(P, X); o = max(0, m - 3)
     _grow(ws, 6, o); _grow(ws, 11 + o, len(_fy_years(X)) - 1)
     for c, t in zip("BCDEF", ["Month", "Total Creditors", "Purchases", "Cumulative Purchases", "Holding period"]):
         ws[c + "2"] = t
@@ -3219,6 +3427,9 @@ def default_period(F):
         deb = sorted({r["date"] for r in F.get("deb_tot", []) if r.get("date") and full(r["date"])})
         if deb:
             first = _ym_add(ym(deb[0]), 1)
+            # not before the first full month of the bank account (Shrigovind: CC opened 20-11-2025 on takeover -> Dec'25)
+            if ym(lo) >= first:                            # only when the account starts after the books' first month
+                first = max(first, ym(lo) if lo.day == 1 else _ym_add(ym(lo), 1))
             last = min(ym(deb[-1]), last_bank)
             if ss and first <= ym(ss[-1]):
                 last = min(last, ym(ss[-1]))         # not past the latest stock statement (Baid: books to Mar'26, SS Feb'26)
@@ -3439,7 +3650,7 @@ def browser_make(form_json, out):
         x["typed"] = True
         if x["qty"] is not None and x["rate"] is not None:
             x["unread"] = False
-        x["hint"] = x["hint"] or e.get("kind", "")
+        x["hint"] = e.get("kind") or x["hint"]          # the typed kind wins (sales / purchase / other = not a trade bill)
     extra = []
     for l in lines(f.get("extra")):
         parts = [x.strip() for x in l.split(",")]
@@ -3454,9 +3665,10 @@ def browser_make(form_json, out):
             return None
     banks = []
     for l in lines(f.get("banks")):                     # 'Axis Bank, 590'  /  'Union Bank, 450, Overdraft'
-        parts = [x.strip() for x in re.split(r"[,:]", l)]
+        parts = [x.strip() for x in re.split(r"[,:]", l)]   # optional 4th / 5th: O/s on base / visit date (confirmation)
         if parts and parts[0]:
-            banks.append((parts[0], sn(parts[1]) if len(parts) > 1 else None, parts[2] if len(parts) > 2 else ""))
+            banks.append((parts[0], sn(parts[1]) if len(parts) > 1 else None, parts[2] if len(parts) > 2 else "",
+                          sn(parts[3]) if len(parts) > 3 else None, sn(parts[4]) if len(parts) > 4 else None))
     facilities = []                                     # 'WCTL GECL, 49.5, 12.375, 8.25' (first bank, besides CC)
     for l in lines(f.get("fac")):
         parts = [x.strip() for x in l.split(",")] + [""] * 4
